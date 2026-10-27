@@ -193,7 +193,7 @@ test('the other side of the road does not slow your route', async () => {
   await (await driver('probe-dev-south1'))('POST', '/api/probe', { consent: true, points: cellFixes(52.507, 6, { heading: 180 }) });
   await (await driver('probe-dev-south2'))('POST', '/api/probe', { consent: true, points: cellFixes(52.507, 6, { heading: 180 }) });
   await (await driver('probe-dev-south3'))('POST', '/api/probe', { consent: true, points: cellFixes(52.507, 6, { heading: 180 }) });
-  const anon = client();
+  const anon = await driver('probe-dev-north1');
   const r = await anon('POST', '/api/route', { from: [13.4, 52.5], to: [13.4, 52.509], heading: 0 });
   assert.equal(r.status, 200);
   assert.equal(r.body.routes[0].probe_jams.length, 0, 'southbound crawl stays off the northbound route');
@@ -205,7 +205,7 @@ test('crawling blocks slow the route and say why', async () => {
   for (const [dev, lat] of [['probe-dev-n1', 52.503], ['probe-dev-n2', 52.503], ['probe-dev-n3', 52.503], ['probe-dev-n4', 52.505], ['probe-dev-n5', 52.505], ['probe-dev-n6', 52.505]]) {
     await (await driver(dev))('POST', '/api/probe', { consent: true, points: cellFixes(lat, 6) });
   }
-  const r = await client()('POST', '/api/route', { from: [13.4, 52.5], to: [13.4, 52.509], heading: 0 });
+  const r = await (await driver('probe-dev-route1'))('POST', '/api/route', { from: [13.4, 52.5], to: [13.4, 52.509], heading: 0 });
   assert.equal(r.status, 200);
   const route = r.body.routes[0];
   assert.ok(route.probe_jams.length >= 1, 'slow blocks become jams on the route');
@@ -274,7 +274,7 @@ test('the nightly job deletes old probe data', async () => {
 });
 
 test('traffic_probe is a synced account setting, off by default', async () => {
-  const c = client();
+  const c = await driver('probe-dev-acct');
   await c('POST', '/api/auth/signup', { email: 'probe@test.com', password: 'password1', name: 'Probo' });
   assert.equal((await c('GET', '/api/me')).body.user.settings.traffic_probe ?? false, false);
   const r = await c('PATCH', '/api/me', { settings: { traffic_probe: true } });

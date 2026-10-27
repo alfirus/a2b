@@ -46,18 +46,23 @@ const AREA_KINDS = new Set([
   'county', 'state', 'commercial', 'retail', 'mall', 'square', 'island', 'region',
 ]);
 
-export async function searchPlaces(env, { q, lat, lng, lang = 'en' }) {
-  const near = Number.isFinite(lat) && Number.isFinite(lng) ? [lng, lat] : null;
-  if (!near) return { places: dedupe(await photon(env, { q, lang })) };
+// One search fans out over the public geocoder: nearby, then everywhere, then (for "name area" queries) the
+// area plus the name near it. Capped so a single search stays a handful of upstream requests.
+const SEARCH_CALLS = 6;
 
-  let found = await photon(env, { q, lang, near, bbox: boxAround(near, LOCAL_KM) }).catch(() => null);
+export async function searchPlaces(env, { q, lat, lng, lang = 'en' }, budget = { left: SEARCH_CALLS }) {
+  const near = Number.isFinite(lat) && Number.isFinite(lng) ? [lng, lat] : null;
+  const call = (args) => (budget.left > 0 ? (budget.left--, photon(env, args)) : Promise.resolve([]));
+  if (!near) return { places: dedupe(await call({ q, lang })) };
+
+  let found = await call({ q, lang, near, bbox: boxAround(near, LOCAL_KM) }).catch(() => null);
   if (!found || found.length < ENOUGH) {
-    const wide = await photon(env, { q, lang, near }).catch((e) => (found ? [] : Promise.reject(e)));
+    const wide = await call({ q, lang, near }).catch((e) => (found ? [] : Promise.reject(e)));
     found = dedupe([...(found ?? []), ...wide]);
   }
 
   // "nandos eco grandeur": a name, then the area it's in. Look for the name around that area.
-  const split = await nameInArea(env, q, lang, near, found).catch(() => ({ places: [] }));
+  const split = await nameInArea(env, q, lang, near, found, call).catch(() => ({ places: [] }));
   let places = dedupe([...split.places, ...found]).map((p) => ({ ...p, km: Math.round(distance(near, [p.lng, p.lat]) / 100) / 10 }));
   if (places.some((p) => p.km <= FAR_KM)) places = places.filter((p) => p.km <= FAR_KM);
   const band = (p) => (p.src ? -1 : BANDS_KM.findIndex((km) => p.km <= km) + 1 || BANDS_KM.length + 1);
@@ -65,7 +70,7 @@ export async function searchPlaces(env, { q, lat, lng, lang = 'en' }) {
   return { places: places.slice(0, 10), note: split.note };
 }
 
-async function nameInArea(env, q, lang, near, found) {
+async function nameInArea(env, q, lang, near, found, call) {
   const words = q.trim().split(/\s+/);
   if (words.length < 2) return { places: [] };
   for (let k = 1; k <= Math.min(3, words.length - 1); k++) {
@@ -73,11 +78,12 @@ async function nameInArea(env, q, lang, near, found) {
     const areaText = words.slice(k).join(' ');
     // Already answered: a result named like the name part that sits in the named area.
     if (found.some((p) => matches(p.name, name) && matches(`${p.name} ${p.address}`, areaText))) return { places: [] };
-    const area = (await photon(env, { q: areaText, lang, near, bbox: boxAround(near, BANDS_KM.at(-1)) }))
-      .find((p) => AREA_KINDS.has(p.category) && matches(p.name, areaText));
+    const area = (await call({ q: areaText, lang, near, bbox: boxAround(near, BANDS_KM.at(-1)) })).find(
+      (p) => AREA_KINDS.has(p.category) && matches(p.name, areaText),
+    );
     if (!area) continue;
     const there = [area.lng, area.lat];
-    const hits = (await photon(env, { q: name, lang, near: there, bbox: boxAround(there, 8) })).filter((p) => matches(p.name, name));
+    const hits = (await call({ q: name, lang, near: there, bbox: boxAround(there, 8) })).filter((p) => matches(p.name, name));
     if (hits.length) return { places: hits.map((p) => ({ ...p, src: 'area' })) };
     return { places: [], note: `No "${name}" found near ${area.name} in the map data.` };
   }
@@ -379,6 +385,28 @@ export function bbox(coords, pad = 0) {
     if (y > b[3]) b[3] = y;
   }
   return [b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad];
+}
+
+// Reports that matter on a drive sit along it, not just at its ends: sample the straight line through the
+// waypoints (the route isn't known yet) so closures in the middle are still avoided. Once the router answers,
+// routeReportBox samples the roads actually driven for the pins and delay on each route.
+export function corridorBox(pts, pad = 0.1, samples = 12) {
+  const out = [];
+  for (let i = 0; i + 1 < pts.length; i++) {
+    for (let k = 0; k <= samples; k++) out.push([pts[i][0] + ((pts[i + 1][0] - pts[i][0]) * k) / samples, pts[i][1] + ((pts[i + 1][1] - pts[i][1]) * k) / samples]);
+  }
+  return bbox(out.length ? out : pts, pad);
+}
+
+export function routeReportBox(routes, extra = [], pad = 0.2) {
+  const pts = [...extra];
+  for (const r of routes) {
+    const c = r.coords ?? [];
+    const step = Math.max(1, Math.ceil(c.length / 12));
+    for (let i = 0; i < c.length; i += step) pts.push(c[i]);
+    if (c.length && pts.at(-1) !== c.at(-1)) pts.push(c.at(-1));
+  }
+  return bbox(pts, pad);
 }
 
 async function getJson(url) {

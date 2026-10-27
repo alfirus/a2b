@@ -8,6 +8,7 @@
 
 export const ACTIVE_MS = 5 * 60_000; // a device counts as in the app if it checked in this recently
 const WAITING_WRITE_MS = 4 * 60_000; // waiting devices are recorded this often at most, to spare D1 writes
+const ROW_CAP = 500; // device ids are self-minted, so a script could grow this table without bound: keep the freshest rows
 
 export function limits(env) {
   const num = (v, d) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : d);
@@ -43,6 +44,10 @@ export function presenceRepo(db) {
              ON CONFLICT(device) DO UPDATE SET user_id = excluded.user_id, admitted = excluded.admitted, last_seen = excluded.last_seen`,
           )
           .bind(device, user?.id ?? null, admitted ? 1 : 0, now)
+          .run();
+        // Admitted drivers checking in stay; everyone else competes for room by freshness.
+        await db
+          .prepare(`DELETE FROM presence WHERE device NOT IN (SELECT device FROM presence ORDER BY admitted DESC, last_seen DESC LIMIT ${ROW_CAP})`)
           .run();
       }
       const wasWaiting = fresh && !row.admitted ? 1 : 0;

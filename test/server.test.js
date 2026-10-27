@@ -7,7 +7,7 @@ import worker from '../src/worker.js';
 import { createD1 } from './d1-shim.js';
 import { hashPassword, verifyPassword, normalizeEmail } from '../src/lib/auth.js';
 import { extendedExpiry, shouldRemove } from '../src/lib/reports.js';
-import { buildRouteRequest, photonToPlace, lanes } from '../src/lib/providers.js';
+import { buildRouteRequest, photonToPlace, lanes, searchPlaces, corridorBox, routeReportBox } from '../src/lib/providers.js';
 import { applyTraffic } from '../src/lib/traffic.js';
 import { camerasAlong } from '../src/lib/cameras.js';
 import { parkingQuery } from '../src/lib/parking.js';
@@ -126,10 +126,15 @@ const ASSETS = {
 };
 const env = { DB: createD1(), ASSETS, ROUTING_URL: 'https://routing.test/route', GEOCODER_URL: 'https://geo.test' };
 
+let nextDevice = 0;
 function client(device) {
   let cookie = '';
-  return async (method, path, body) => {
-    const headers = device ? { 'x-a2b-device': device } : {};
+  // The app checks in on launch and sends its device id with every request; clients without an explicit device
+  // do the same, so they get a fresh id and check in before their first gated call.
+  const auto = device === undefined;
+  if (auto) device = `test-device-${++nextDevice}`;
+  const raw = async (method, path, body) => {
+    const headers = { 'x-a2b-device': device };
     if (cookie) headers.cookie = cookie;
     if (body !== undefined) headers['content-type'] = 'application/json';
     const res = await worker.fetch(new Request(`https://a2b.test${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) }), env);
@@ -137,6 +142,19 @@ function client(device) {
     if (set) cookie = set.split(';')[0];
     return { status: res.status, body: await res.json(), cookie: set };
   };
+  return async (method, path, body) => {
+    // Before every gated call: tables are wiped between tests, and the app itself checks in on launch.
+    if (auto && needsSpot(method, path)) await raw('POST', '/api/presence');
+    return raw(method, path, body);
+  };
+}
+
+// Search, routing, reverse and parking need a checked-in spot; feedback needs only a valid device id (it stays
+// open even when A2B is full). Everything else (accounts, places, reports, trips) doesn't.
+function needsSpot(method, path) {
+  if (path === '/api/presence') return false;
+  if (method === 'GET' && (path.startsWith('/api/search') || path.startsWith('/api/reverse') || path.startsWith('/api/parking'))) return true;
+  return method === 'POST' && path === '/api/route';
 }
 
 let alice, bob;
@@ -157,8 +175,8 @@ test('passwords hash and verify', async () => {
 test('report lifetimes and removal rules', () => {
   const now = 1_000_000;
   const life = REPORT_TYPES.police.life * 60_000;
-  assert.equal(extendedExpiry('police', now + life, now), now + life * 1.5);
-  assert.equal(extendedExpiry('police', now + life * 3, now), now + life * 3, 'capped at three lifetimes');
+  assert.equal(extendedExpiry('police', now + life, now), now + life * 1.25);
+  assert.equal(extendedExpiry('police', now + life * 3, now), now + life * 2, 'capped at two lifetimes');
   assert.ok(!shouldRemove({ still: 0, gone: 1 }));
   assert.ok(shouldRemove({ still: 0, gone: 2 }));
   assert.ok(!shouldRemove({ still: 2, gone: 3 }));
@@ -254,12 +272,13 @@ test('reports: create, merge, thank, dismiss', async () => {
   assert.equal(made.body.report.comment, 'behind the bridge');
   const id = made.body.report.id;
 
-  // Bob reports the same thing 50 m away: it confirms Alice's report instead of adding a pin.
+  // Bob reports the same thing 50 m away: it thanks Alice instead of adding a pin (a duplicate no longer
+  // inflates "still there", which used to make reports nearly impossible to remove).
   const dup = await bob('POST', '/api/reports', { type: 'police', lat: 52.5054, lng: 13.4 });
   assert.equal(dup.body.merged, true);
   assert.equal(dup.body.report.id, id);
-  assert.equal(dup.body.report.still, 1);
-  assert.ok(dup.body.report.expires_at > made.body.report.expires_at);
+  assert.equal(dup.body.report.thanks, 1);
+  assert.equal(dup.body.report.expires_at, made.body.report.expires_at, 'a duplicate thanks without extending the report');
 
   const thanked = await bob('POST', `/api/reports/${id}/vote`, { vote: 'thanks' });
   assert.equal(thanked.body.report.thanks, 1);
@@ -270,7 +289,7 @@ test('reports: create, merge, thank, dismiss', async () => {
   assert.equal(list.body.reports[0].by, 'Alice');
 
   const me = await alice('GET', '/api/me');
-  assert.equal(me.body.user.points, REPORT_TYPES.police.points + 2, 'reporter earns from confirmations and thanks');
+  assert.equal(me.body.user.points, REPORT_TYPES.police.points + 1, 'reporter earns from the duplicate thanks');
   assert.deepEqual([me.body.stats.reports, me.body.stats.thanks], [1, 1]);
 
   // Alice says it's gone: her own report disappears.
@@ -540,10 +559,12 @@ test('testing tools are flagged only for accounts in TESTER_EMAILS', async () =>
 
 test('feedback: anyone can send it, only the owner can read it and mark it done', async () => {
   const guest = client('feedback-guest-1');
+  await guest('POST', '/api/presence');
   assert.equal((await guest('POST', '/api/feedback', { message: ' ' })).status, 400, 'empty feedback is refused');
   assert.equal((await guest('POST', '/api/feedback', { message: 'Route to KLCC took a closed road', app: 'abc123' })).status, 201);
   const fran = client('feedback-fran-1');
   await fran('POST', '/api/auth/signup', { email: 'fran@test.com', password: 'password8', name: 'Fran' });
+  await fran('POST', '/api/presence');
   assert.equal((await fran('POST', '/api/feedback', { message: 'Love the speed camera alerts!' })).status, 201);
 
   const owner = client();
@@ -621,6 +642,7 @@ test('a closure blocks the road it was reported on, and says so when it cannot b
 
 test('only so many devices get a spot at once, and accounts can take the ones guests cannot', async () => {
   Object.assign(env, { MAX_ACTIVE: '3', MAX_GUESTS: '1' });
+  await env.DB.prepare('DELETE FROM presence').run(); // earlier tests checked their devices in
   try {
     const guestA = client('guest-device-a'), guestB = client('guest-device-b');
     let r = await guestA('POST', '/api/presence');
@@ -643,8 +665,14 @@ test('only so many devices get a spot at once, and accounts can take the ones gu
     r = await gus('POST', '/api/presence');
     assert.deepEqual(r.body, { admitted: false, active: 3, max: 3, waiting: 1 }, 'full, even for accounts');
 
-    // An app without a device id (an older version) isn't held up.
-    assert.equal((await client()('POST', '/api/route', { from: [13.4, 52.5], to: [13.4, 52.509] })).status, 200);
+    // An app without a device id (an older version) is told to update instead of slipping past the cap.
+    const bare = await worker.fetch(
+      new Request('https://a2b.test/api/route', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ from: [13.4, 52.5], to: [13.4, 52.509] }) }),
+      env,
+    );
+    assert.equal(bare.status, 400);
+    // And a device that never checked in waits like everyone else, even when guests are full.
+    assert.equal((await client()('POST', '/api/route', { from: [13.4, 52.5], to: [13.4, 52.509] })).body.code, 'full');
   } finally {
     delete env.MAX_ACTIVE;
     delete env.MAX_GUESTS;
@@ -686,4 +714,196 @@ test('parking near a destination: nearest first, with what kind it is and whethe
   assert.equal(near.fee, false);
   assert.ok(near.distance < 30);
   assert.deepEqual([far.kind, far.fee, far.capacity], ['Multi-storey', true, 400]);
+});
+
+// ---------- Hunt fixes (Oct 2026): one regression test per finding ----------
+
+test('route, search and reverse need a device and a spot; feedback needs only a device', async () => {
+  const route = (headers) =>
+    worker.fetch(
+      new Request('https://a2b.test/api/route', { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ from: [13.4, 52.5], to: [13.4, 52.509] }) }),
+      env,
+    );
+  assert.equal((await route({})).status, 400, 'no device id: told to update, not let through');
+  assert.equal((await route({ 'x-a2b-device': 'stranger-device-1' })).status, 503, 'a device that never checked in waits');
+  const s = await worker.fetch(new Request('https://a2b.test/api/search?q=alex&lat=52.5&lng=13.4', { headers: { 'x-a2b-device': 'stranger-device-1' } }), env);
+  assert.equal(s.status, 503);
+  const fb = await worker.fetch(
+    new Request('https://a2b.test/api/feedback', { method: 'POST', headers: { 'content-type': 'application/json', 'x-a2b-device': 'stranger-device-1' }, body: JSON.stringify({ message: 'hello there' }) }),
+    env,
+  );
+  assert.equal(fb.status, 201, 'feedback stays open with just a device id, even with no spot');
+  const fbBare = await worker.fetch(
+    new Request('https://a2b.test/api/feedback', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'hello there' }) }),
+    env,
+  );
+  assert.equal(fbBare.status, 400, 'feedback without any device id is still refused');
+});
+
+test('sign-ups need a device; a taken address gets the same neutral 409', async () => {
+  const device = { 'x-a2b-device': 'signup-device-1' };
+  const signup = (email, headers = { 'content-type': 'application/json', ...device }) =>
+    worker.fetch(
+      new Request('https://a2b.test/api/auth/signup', { method: 'POST', headers, body: JSON.stringify({ email, password: 'password1', name: 'Farmer' }) }),
+      env,
+    );
+  assert.equal((await signup('nodevice@test.com', { 'content-type': 'application/json' })).status, 400);
+  assert.equal((await signup('farmer0@test.com')).status, 201);
+  // A taken address gets the same answer either way (plus a UNIQUE race guard in the endpoint).
+  const dup = await signup('farmer0@test.com');
+  assert.equal(dup.status, 409);
+  assert.equal((await dup.json()).error, 'This email address is already registered.');
+});
+
+test('reports far from the driver are refused when their position is known', async () => {
+  const rick = client();
+  await rick('POST', '/api/auth/signup', { email: 'rick@test.com', password: 'password11', name: 'Rick' });
+  const made = await rick('POST', '/api/trips', { destination: { name: 'Work', lat: 52.509, lng: 13.4 }, route: [] });
+  await rick('PATCH', `/api/trips/${made.body.token}`, { position: [13.4, 52.501] });
+  assert.equal((await rick('POST', '/api/reports', { type: 'police', lat: 52.502, lng: 13.401 })).status, 201, 'around the driver: goes through');
+  assert.equal((await rick('POST', '/api/reports', { type: 'closure', lat: 1.29, lng: 103.85 })).status, 403, 'across the country: refused');
+  const mort = client();
+  await mort('POST', '/api/auth/signup', { email: 'mort@test.com', password: 'password12', name: 'Mort' });
+  assert.equal((await mort('POST', '/api/reports', { type: 'police', lat: 1.29, lng: 103.85 })).status, 201, 'no known position: still goes through');
+});
+
+test('a long route looks for reports along the way, not just at its ends', () => {
+  const inside = ([x, y], [w, s, e, n]) => x >= w && x <= e && y >= s && y <= n;
+  const from = [0, 0], to = [0, 2];
+  // A route that bows far east of its straight line: sampling only the ends would miss the middle.
+  const route = { coords: [[0, 0], [0.5, 0.5], [1, 1], [0.5, 1.5], [0, 2]] };
+  assert.ok(!inside([1, 1], [from[0] - 0.2, from[1] - 0.2, to[0] + 0.2, to[1] + 0.2]), 'the old ends-only box misses the bow');
+  assert.ok(inside([1, 1], routeReportBox([route], [from, to])), 'sampling the driven roads covers it');
+  assert.ok(inside([0, 1], corridorBox([from, to])), 'the straight-line corridor covers the middle before routing');
+});
+
+test('changing the password ends other sessions and rotates your own', async () => {
+  const s1 = client(), s2 = client();
+  await s1('POST', '/api/auth/signup', { email: 'pascal@test.com', password: 'password13', name: 'Pascal' });
+  await s2('POST', '/api/auth/login', { email: 'pascal@test.com', password: 'password13' });
+  assert.equal((await s2('GET', '/api/me')).body.user.name, 'Pascal');
+  const changed = await s1('PATCH', '/api/me', { password: 'newpassword13', current_password: 'password13' });
+  assert.equal(changed.status, 200);
+  assert.ok(changed.cookie, 'a fresh session cookie for the device the password changed on');
+  assert.equal((await s2('GET', '/api/me')).body.user, null, 'the other session is dead');
+  assert.equal((await s1('GET', '/api/me')).body.user.name, 'Pascal', 'your own session keeps working');
+});
+
+test('sign-ins are throttled per address, not per network', async () => {
+  const attempt = (email) =>
+    worker.fetch(
+      new Request('https://a2b.test/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: 'wrong-password' }) }),
+      env,
+    );
+  try {
+    // One address hammered: stops at 8 wrong passwords a quarter hour.
+    for (let i = 0; i < 8; i++) assert.equal((await attempt('hammered@test.com')).status, 401);
+    assert.equal((await attempt('hammered@test.com')).status, 429, 'wrong passwords for one account stop here');
+    // A different address is unaffected: there is no shared per-network throttle.
+    assert.equal((await attempt('someone-else@test.com')).status, 401);
+  } finally {
+    await env.DB.prepare("DELETE FROM login_failures WHERE email IN ('hammered@test.com', 'someone-else@test.com')").run();
+  }
+});
+
+test('malformed bodies are 400s and odd langs do not break search', async () => {
+  const post = (body) => worker.fetch(new Request('https://a2b.test/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body }), env);
+  assert.equal((await post('null')).status, 400);
+  assert.equal((await post('"just a string"')).status, 400);
+  assert.equal((await post('[1,2]')).status, 400, 'arrays are not bodies');
+  // A string where settings belong is ignored instead of blowing up (used to be a 500 from `in`).
+  const c = client();
+  const r = await c('POST', '/api/auth/signup', { email: 'settings@test.com', password: 'password14', name: 'Set', settings: 'nope' });
+  assert.equal(r.status, 201);
+  assert.deepEqual(r.body.user.settings, {});
+  const s = await c('GET', '/api/search?q=alex&lat=52.5&lng=13.4&lang=en%20US');
+  assert.equal(s.status, 200, 'a space in lang no longer breaks the cache key');
+});
+
+test('a search stays a handful of upstream requests', async () => {
+  let calls = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (...a) => {
+    if (String(a[0]).includes('geo.budget')) calls++;
+    return orig(...a);
+  };
+  try {
+    const r = await searchPlaces({ GEOCODER_URL: 'https://geo.budget' }, { q: 'nandos eco grandeur', lat: 3.22, lng: 101.47, lang: 'en' });
+    assert.equal(r.places[0].name, "Nando's");
+    assert.ok(calls <= 6, `${calls} upstream calls`);
+    // And with no budget left it makes none at all.
+    calls = 0;
+    const empty = await searchPlaces({ GEOCODER_URL: 'https://geo.budget' }, { q: 'nandos eco grandeur', lat: 3.22, lng: 101.47, lang: 'en' }, { left: 0 });
+    assert.deepEqual(empty.places, []);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('switching a vote replaces it instead of double counting', async () => {
+  const voter = client();
+  await voter('POST', '/api/auth/signup', { email: 'voter@test.com', password: 'password15', name: 'Voter' });
+  // Carol's jam from the routing test is still on the map: confirm it, then change the mind.
+  const jam = (await voter('GET', '/api/reports?bbox=13.3,52.4,13.5,52.6')).body.reports.find((r) => r.type === 'traffic');
+  assert.ok(jam);
+  let v = await voter('POST', `/api/reports/${jam.id}/vote`, { vote: 'still' });
+  assert.equal(v.body.report.still, 1);
+  v = await voter('POST', `/api/reports/${jam.id}/vote`, { vote: 'gone' });
+  assert.deepEqual([v.body.report.still, v.body.report.gone], [0, 1], 'the still is replaced, not kept');
+  assert.equal(v.body.removed, false, 'one gone does not remove it');
+  v = await voter('POST', `/api/reports/${jam.id}/vote`, { vote: 'gone' });
+  assert.deepEqual([v.body.report.still, v.body.report.gone], [0, 1], 'voting twice changes nothing');
+});
+
+test('a forgotten password is recovered with the code shown at sign-up', async () => {
+  const c = client();
+  const signup = await c('POST', '/api/auth/signup', { email: 'loss@test.com', password: 'password16', name: 'Loss' });
+  assert.equal(signup.status, 201);
+  assert.match(signup.body.recovery_code, /^[0-9a-f]{16}$/);
+  const other = client();
+  await other('POST', '/api/auth/login', { email: 'loss@test.com', password: 'password16' });
+  // Unknown addresses get the same answer: the endpoint can't list accounts.
+  assert.equal((await other('POST', '/api/auth/recover', { email: 'nobody@test.com', code: signup.body.recovery_code, password: 'newpassword16' })).status, 401);
+  assert.equal((await other('POST', '/api/auth/recover', { email: 'loss@test.com', code: 'wrongcode', password: 'newpassword16' })).status, 401);
+  assert.equal((await other('POST', '/api/auth/recover', { email: 'loss@test.com', code: signup.body.recovery_code, password: 'newpassword16' })).status, 200);
+  assert.equal((await c('GET', '/api/me')).body.user, null, 'recovery signs every device out');
+  assert.equal((await other('POST', '/api/auth/login', { email: 'loss@test.com', password: 'newpassword16' })).status, 200, 'the new password works');
+  assert.equal((await other('POST', '/api/auth/recover', { email: 'loss@test.com', code: signup.body.recovery_code, password: 'anotherpassword16' })).status, 401, 'a code works once');
+  // No expiry: a code from sign-up day still works months later.
+  const old = client();
+  const signupOld = await old('POST', '/api/auth/signup', { email: 'oldcode@test.com', password: 'password18', name: 'Old' });
+  const oldId = (await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind('oldcode@test.com').first()).id;
+  await env.DB.prepare('UPDATE recovery_codes SET created_at = ? WHERE user_id = ?').bind(Date.now() - 90 * 86400_000, oldId).run();
+  assert.equal((await old('POST', '/api/auth/recover', { email: 'oldcode@test.com', code: signupOld.body.recovery_code, password: 'newpassword18' })).status, 200, 'a 90-day-old code still resets the password');
+});
+
+test('sessions slide while driving and can be revoked one by one', async () => {
+  const a = client('session-dev-a'), b = client('session-dev-b');
+  await a('POST', '/api/auth/signup', { email: 'sess@test.com', password: 'password17', name: 'Sess' });
+  await b('POST', '/api/auth/login', { email: 'sess@test.com', password: 'password17' });
+  const me = await a('GET', '/api/me');
+  assert.equal(me.body.sessions.length, 2);
+  assert.ok(me.body.sessions.some((s) => s.current && s.device === 'session-dev-a'));
+  const other = me.body.sessions.find((s) => !s.current);
+  assert.equal(other.device, 'session-dev-b');
+  // Age the session almost out: the next request slides it forward again.
+  await env.DB.prepare('UPDATE sessions SET expires_at = ?, created_at = ?, last_seen = ? WHERE substr(token_hash, 1, 12) = ?')
+    .bind(Date.now() + 1000, Date.now(), Date.now(), other.id)
+    .run();
+  await b('GET', '/api/me');
+  const after = (await env.DB.prepare('SELECT expires_at FROM sessions WHERE substr(token_hash, 1, 12) = ?').bind(other.id).first()).expires_at;
+  assert.ok(after > Date.now() + 3600_000, 'slid forward instead of expiring');
+  assert.equal((await a('DELETE', `/api/me/sessions/${other.id}`)).status, 200);
+  assert.equal((await b('GET', '/api/me')).body.user, null, 'that device is signed out');
+  assert.equal((await a('DELETE', '/api/me/sessions/deadbeefcafe')).status, 404);
+});
+
+test('presence check-ins admit new devices without a per-network throttle', async () => {
+  const check = (d) => worker.fetch(new Request('https://a2b.test/api/presence', { method: 'POST', headers: { 'x-a2b-device': d } }), env);
+  try {
+    for (let i = 0; i < 5; i++) assert.equal((await check(`fresh-device-${i}`)).status, 200);
+  } finally {
+    await env.DB.prepare('DELETE FROM presence').run();
+  }
 });
