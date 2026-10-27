@@ -4,8 +4,11 @@
 import { ensureSchema } from './lib/schema.js';
 import {
   hashPassword, verifyPassword, normalizeEmail, validatePassword, cleanName, createSession, currentUser, destroySession,
-  sessionCookie, publicUser,
+  sessionCookie, publicUser, randomToken, sha256,
 } from './lib/auth.js';
+import { captchaEnabled, captchaSiteKey, verifyCaptcha } from './lib/captcha.js';
+import { emailVerificationMode, emailVerificationRequired, sendVerificationEmail } from './lib/email.js';
+import { generateSecret, otpauthURL, verifyTOTP, twoFactorMode } from './lib/twofactor.js';
 import { searchPlaces, reverseGeocode, fetchRoutes, fetchRouteAttributes, annotateWithReports, httpError, bbox, roadMidpoint, MAX_EXCLUDE } from './lib/providers.js';
 import { constructionTwins } from './lib/construction.js';
 import { liveTraffic, applyTraffic } from './lib/traffic.js';
@@ -19,6 +22,11 @@ import { usageRepo, USAGE_DAYS, dayOf } from './lib/usage.js';
 const MAX_BODY = 64 * 1024;
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const LOGIN_MAX_FAILURES = 8;
+const LOGIN_CAPTCHA_AFTER_FAILURES = 3; // once a password looks guessed, logins also need the CAPTCHA
+const VERIFY_TTL_MS = 24 * 3600_000; // email links last a day
+const CHALLENGE_TTL_MS = 10 * 60_000; // the second login step lasts ten minutes
+const SIGNUP_WINDOW_MS = 3600_000; // signup attempts are counted per hour, per network
+const RESEND_MAX_PER_HOUR = 5;
 const RECENTS_KEPT = 20;
 const FULL_MESSAGE = 'A2B is full right now. You will be let in when a spot opens.';
 const SETTINGS_KEYS = { voice: 'boolean', speed_warning: 'boolean', units: ['metric', 'imperial'], theme: ['auto', 'day', 'night'], avoid_tolls: 'boolean', avoid_highways: 'boolean', avoid_ferries: 'boolean', alerts: 'boolean' };
@@ -47,6 +55,9 @@ export default {
       env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now),
       env.DB.prepare('DELETE FROM trips WHERE updated_at < ?').bind(now - 2 * 86400_000),
       env.DB.prepare('DELETE FROM login_failures WHERE at < ?').bind(now - LOGIN_WINDOW_MS),
+      env.DB.prepare('DELETE FROM email_verifications WHERE expires_at < ?').bind(now),
+      env.DB.prepare('DELETE FROM auth_challenges WHERE expires_at < ?').bind(now),
+      env.DB.prepare('DELETE FROM signup_attempts WHERE at < ?').bind(now - SIGNUP_WINDOW_MS),
       env.DB.prepare('DELETE FROM presence WHERE last_seen < ?').bind(now - 86400_000),
       env.DB.prepare('DELETE FROM usage_devices WHERE day < ?').bind(dayOf(now - USAGE_DAYS * 86400_000)),
       env.DB.prepare('DELETE FROM usage_daily WHERE day < ?').bind(dayOf(now - USAGE_DAYS * 86400_000)),
@@ -121,9 +132,21 @@ async function route(request, env, url) {
     return json({ ok: true });
   }
 
+  // Public knobs the sign-in screen reads: which signup/login checks are on.
+  if (path === '/api/config' && method === 'GET') {
+    return json({
+      captcha: { enabled: captchaEnabled(env), siteKey: captchaSiteKey(env) },
+      emailVerification: { mode: emailVerificationMode(env), required: emailVerificationRequired(env) },
+      twoFactor: { mode: twoFactorMode(env) },
+    });
+  }
+
   // ---------- Accounts ----------
   if (path === '/api/auth/signup' && method === 'POST') {
+    const ip = clientIp(request);
+    await checkSignupThrottle(db, env, ip);
     const body = await readJson(request);
+    await verifyCaptcha(env, body.captcha, ip);
     const email = normalizeEmail(body.email);
     if (!email) throw httpError('Enter a valid email address.', 400);
     const bad = validatePassword(body.password);
@@ -131,27 +154,156 @@ async function route(request, env, url) {
     if (await db.prepare('SELECT 1 FROM users WHERE email = ?').bind(email).first()) throw httpError('An account with this email already exists. Log in instead.', 409);
     const { hash, salt } = await hashPassword(body.password);
     const settings = cleanSettings(body.settings ?? {});
+    const mode = emailVerificationMode(env);
+    const mustVerify = mode === 'required';
     const row = await db
-      .prepare('INSERT INTO users (email, name, pass_hash, pass_salt, settings, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING *')
-      .bind(email, cleanName(body.name, email), hash, salt, JSON.stringify(settings), Date.now())
+      .prepare('INSERT INTO users (email, name, pass_hash, pass_salt, settings, email_verified, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *')
+      .bind(email, cleanName(body.name, email), hash, salt, JSON.stringify(settings), mustVerify ? 0 : 1, Date.now())
       .first();
     await count('signups');
-    return withSession(request, db, row, 201);
+    // A verification email goes out whenever verification is on; without an email provider
+    // configured the link is only logged server-side (see src/lib/email.js).
+    let verificationToken;
+    if (mode !== 'off') {
+      try {
+        verificationToken = await issueVerification(db, env, request, row);
+      } catch (e) {
+        if (e.status === 429) throw e;
+        console.warn('verification email failed:', e?.message ?? e);
+      }
+    }
+    const debug = env.EMAIL_DEBUG === '1' && verificationToken ? { verificationToken } : {};
+    if (mustVerify) {
+      // No session yet: the link in the email logs them in.
+      return json({ user: publicUser(row), verificationRequired: true, verificationSent: true, ...debug }, 201);
+    }
+    return withSession(request, db, row, 201, mode === 'optional' ? { verificationSent: true, ...debug } : debug);
   }
 
   if (path === '/api/auth/login' && method === 'POST') {
+    const ip = clientIp(request);
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     if (!email) throw httpError('Wrong email or password.', 401);
     const recent = await db.prepare('SELECT COUNT(*) AS n FROM login_failures WHERE email = ? AND at > ?').bind(email, Date.now() - LOGIN_WINDOW_MS).first();
     if (recent.n >= LOGIN_MAX_FAILURES) throw httpError('Too many wrong passwords. Try again in 15 minutes.', 429);
+    if (captchaEnabled(env) && recent.n >= LOGIN_CAPTCHA_AFTER_FAILURES) await verifyCaptcha(env, body.captcha, ip);
     const row = await db.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
     if (!row || !(await verifyPassword(String(body.password ?? ''), row.pass_hash, row.pass_salt))) {
       await db.prepare('INSERT INTO login_failures (email, at) VALUES (?, ?)').bind(email, Date.now()).run();
       throw httpError('Wrong email or password.', 401);
     }
+    if (emailVerificationRequired(env) && !row.email_verified) {
+      throw Object.assign(httpError('Check your email for the verification link, then log in.', 403), { code: 'email_not_verified' });
+    }
     await db.prepare('DELETE FROM login_failures WHERE email = ?').bind(email).run();
+    const tf = twoFactorMode(env);
+    if (tf !== 'off' && row.totp_enabled) {
+      return json({ two_factor_required: true, challenge_id: await issueChallenge(db, row.id, 'totp') }, 202);
+    }
+    if (tf === 'required' && !row.totp_enabled) {
+      // This account predates the requirement: set up the authenticator as the second login step.
+      const secret = generateSecret();
+      const challenge_id = await issueChallenge(db, row.id, 'totp_setup', secret);
+      return json({ two_factor_setup_required: true, challenge_id, secret, otpauth_url: otpauthURL(secret, row.email) }, 202);
+    }
     return withSession(request, db, row, 200);
+  }
+
+  // The link in the verification email lands here (see public/app.js): it confirms the
+  // address and logs the driver straight in.
+  if (path === '/api/auth/verify' && method === 'GET') {
+    const token = String(url.searchParams.get('token') ?? '');
+    if (!/^[0-9a-f]{64}$/.test(token)) throw httpError('That verification link is wrong. Ask for a new email below.', 400);
+    const now = Date.now();
+    const pending = await db.prepare('SELECT * FROM email_verifications WHERE token_hash = ?').bind(await sha256(token)).first();
+    if (!pending || pending.expires_at <= now) {
+      if (pending) await db.prepare('DELETE FROM email_verifications WHERE token_hash = ?').bind(pending.token_hash).run();
+      throw httpError('That verification link expired. Ask for a new email below.', 400);
+    }
+    const row = await db.prepare('UPDATE users SET email_verified = 1 WHERE id = ? RETURNING *').bind(pending.user_id).first();
+    await db.prepare('DELETE FROM email_verifications WHERE user_id = ?').bind(pending.user_id).run();
+    return withSession(request, db, row, 200);
+  }
+
+  if (path === '/api/auth/resend' && method === 'POST') {
+    const body = await readJson(request);
+    const email = normalizeEmail(body.email);
+    let verificationToken;
+    if (email) {
+      const row = await db.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
+      if (row && !row.email_verified) {
+        try {
+          verificationToken = await issueVerification(db, env, request, row);
+        } catch (e) {
+          if (e.status === 429) throw e;
+          console.warn('verification email failed:', e?.message ?? e);
+        }
+      }
+    }
+    const out = { ok: true };
+    if (env.EMAIL_DEBUG === '1' && verificationToken) out.verificationToken = verificationToken;
+    return json(out);
+  }
+
+  // ---------- Two-factor authentication (TOTP authenticator apps) ----------
+  if (path === '/api/auth/2fa/setup' && method === 'POST') {
+    if (twoFactorMode(env) === 'off') throw httpError('Not found.', 404);
+    const u = needUser();
+    if (u.totp_enabled) throw httpError('Two-factor is already on for this account.', 400);
+    const secret = generateSecret();
+    await db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 0 WHERE id = ?').bind(secret, u.id).run();
+    return json({ secret, otpauth_url: otpauthURL(secret, u.email) });
+  }
+
+  if (path === '/api/auth/2fa/enable' && method === 'POST') {
+    if (twoFactorMode(env) === 'off') throw httpError('Not found.', 404);
+    const u = needUser();
+    const body = await readJson(request);
+    if (u.totp_enabled) throw httpError('Two-factor is already on for this account.', 400);
+    if (!u.totp_secret) throw httpError('Start two-factor setup first.', 400);
+    if (!(await verifyTOTP(u.totp_secret, body.code))) {
+      throw Object.assign(httpError('That code is wrong. Check your authenticator app and try again.', 401), { code: 'totp_invalid' });
+    }
+    const row = await db.prepare('UPDATE users SET totp_enabled = 1 WHERE id = ? RETURNING *').bind(u.id).first();
+    return json({ ok: true, user: publicUser(row) });
+  }
+
+  if (path === '/api/auth/2fa/disable' && method === 'POST') {
+    if (twoFactorMode(env) === 'off') throw httpError('Not found.', 404);
+    const u = needUser();
+    const body = await readJson(request);
+    if (!u.totp_enabled) throw httpError('Two-factor is already off.', 400);
+    const okCode = body.code && u.totp_secret && (await verifyTOTP(u.totp_secret, body.code));
+    const okPass = body.current_password && (await verifyPassword(String(body.current_password), u.pass_hash, u.pass_salt));
+    if (!okCode && !okPass) throw httpError('Enter a current code or your password to turn it off.', 403);
+    const row = await db.prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = ? RETURNING *').bind(u.id).first();
+    return json({ ok: true, user: publicUser(row) });
+  }
+
+  // The second login step: a code from the authenticator app, for the challenge login issued.
+  if (path === '/api/auth/2fa/verify' && method === 'POST') {
+    if (twoFactorMode(env) === 'off') throw httpError('Not found.', 404);
+    const body = await readJson(request);
+    const cid = String(body.challenge_id ?? '');
+    if (!/^[0-9a-f]{64}$/.test(cid)) throw httpError('That login step expired. Log in again.', 400);
+    const ch = await db.prepare('SELECT * FROM auth_challenges WHERE token_hash = ?').bind(await sha256(cid)).first();
+    if (!ch || ch.expires_at <= Date.now()) {
+      if (ch) await db.prepare('DELETE FROM auth_challenges WHERE token_hash = ?').bind(ch.token_hash).run();
+      throw httpError('That login step expired. Log in again.', 400);
+    }
+    const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(ch.user_id).first();
+    const secret = ch.purpose === 'totp_setup' ? ch.secret : row?.totp_secret;
+    if (!row || !secret || !(await verifyTOTP(secret, body.code))) {
+      throw Object.assign(httpError('That code is wrong. Check your authenticator app and try again.', 401), { code: 'totp_invalid' });
+    }
+    await db.prepare('DELETE FROM auth_challenges WHERE token_hash = ?').bind(ch.token_hash).run();
+    let user = row;
+    if (ch.purpose === 'totp_setup' && !row.totp_enabled) {
+      user = await db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ? RETURNING *').bind(secret, row.id).first();
+    }
+    await db.prepare('DELETE FROM login_failures WHERE email = ?').bind(row.email).run();
+    return withSession(request, db, user, 200);
   }
 
   if (path === '/api/auth/logout' && method === 'POST') {
@@ -193,8 +345,10 @@ async function route(request, env, url) {
       db.prepare('DELETE FROM trips WHERE user_id = ?').bind(u.id),
       db.prepare('DELETE FROM votes WHERE user_id = ?').bind(u.id),
       db.prepare('DELETE FROM feedback WHERE user_id = ?').bind(u.id),
+      db.prepare('DELETE FROM email_verifications WHERE user_id = ?').bind(u.id),
+      db.prepare('DELETE FROM auth_challenges WHERE user_id = ?').bind(u.id),
       db.prepare('UPDATE reports SET removed = 1 WHERE user_id = ?').bind(u.id),
-      db.prepare("UPDATE users SET email = 'deleted-' || id || '@invalid', name = 'Former driver', pass_hash = '', pass_salt = '', home = NULL, work = NULL WHERE id = ?").bind(u.id),
+      db.prepare("UPDATE users SET email = 'deleted-' || id || '@invalid', name = 'Former driver', pass_hash = '', pass_salt = '', home = NULL, work = NULL, email_verified = 0, totp_secret = NULL, totp_enabled = 0 WHERE id = ?").bind(u.id),
     ]);
     return json({ ok: true }, 200, { 'set-cookie': sessionCookie(request, null) });
   }
@@ -472,9 +626,61 @@ async function route(request, env, url) {
   throw httpError('Not found.', 404);
 }
 
-async function withSession(request, db, row, status) {
+async function withSession(request, db, row, status, extra = {}) {
   const { token, expires } = await createSession(db, row.id);
-  return json({ user: publicUser(row) }, status, { 'set-cookie': sessionCookie(request, token, expires) });
+  return json({ user: publicUser(row), ...extra }, status, { 'set-cookie': sessionCookie(request, token, expires) });
+}
+
+function clientIp(request) {
+  const h = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || '';
+  return h.split(',')[0].trim().slice(0, 80);
+}
+
+function signupLimit(env) {
+  const n = Number(env.SIGNUP_MAX_PER_HOUR);
+  return Number.isInteger(n) && n > 0 ? n : 20;
+}
+
+// At most a handful of accounts per hour from one network, so open signup can't be farmed.
+async function checkSignupThrottle(db, env, ip) {
+  if (!ip) return;
+  const now = Date.now();
+  const recent = await db.prepare('SELECT COUNT(*) AS n FROM signup_attempts WHERE ip = ? AND at > ?').bind(ip, now - SIGNUP_WINDOW_MS).first();
+  await db.prepare('INSERT INTO signup_attempts (ip, at) VALUES (?, ?)').bind(ip, now).run();
+  if (recent.n >= signupLimit(env)) {
+    throw Object.assign(httpError('Too many sign-ups from this network. Try again in an hour.', 429), { code: 'signup_throttled' });
+  }
+}
+
+// A fresh verification email: old links die, at most a few an hour per account.
+async function issueVerification(db, env, request, user) {
+  const now = Date.now();
+  const recent = await db
+    .prepare('SELECT COUNT(*) AS n FROM email_verifications WHERE user_id = ? AND created_at > ?')
+    .bind(user.id, now - 3600_000)
+    .first();
+  if (recent.n >= RESEND_MAX_PER_HOUR) {
+    throw Object.assign(httpError('Too many verification emails. Try again in an hour.', 429), { code: 'resend_throttled' });
+  }
+  await db.prepare('DELETE FROM email_verifications WHERE user_id = ?').bind(user.id).run();
+  const token = randomToken(32);
+  await db
+    .prepare('INSERT INTO email_verifications (token_hash, user_id, email, created_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .bind(await sha256(token), user.id, user.email, now, now + VERIFY_TTL_MS)
+    .run();
+  await sendVerificationEmail(env, user.email, token, request);
+  return token;
+}
+
+// The first half of a two-factor login: the app answers with the code for this challenge id.
+async function issueChallenge(db, userId, purpose, secret = null) {
+  const token = randomToken(32);
+  const now = Date.now();
+  await db
+    .prepare('INSERT INTO auth_challenges (token_hash, user_id, purpose, secret, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(await sha256(token), userId, purpose, secret, now, now + CHALLENGE_TTL_MS)
+    .run();
+  return token;
 }
 
 // Testing tools (demo drive) are for the accounts listed in the TESTER_EMAILS secret, comma separated

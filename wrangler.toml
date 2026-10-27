@@ -27,3 +27,25 @@ GEOCODER_URL = "https://photon.komoot.io"
 # How many devices can use the app at once, and how many of those spots guests can take (accounts get the rest).
 MAX_ACTIVE = "50"
 MAX_GUESTS = "30"
+
+# ---------- Signup & login protections (all optional, all off by default except 2FA opt-in) ----------
+# CAPTCHA (Cloudflare Turnstile): set true + the keys below to require it on signup
+# (and on logins once a password looks guessed).
+CAPTCHA_ENABLED = "false"
+TURNSTILE_SITEKEY = ""
+# Email verification: "off" | "optional" (welcome email, login still works) | "required" (login blocked until verified).
+EMAIL_VERIFICATION = "false"
+EMAIL_FROM = ""
+APP_BASE_URL = ""
+# Two-factor logins (TOTP authenticator apps): "off" | "optional" (per-driver opt-in) | "required" (everyone).
+TWO_FACTOR = "optional"
+# How many accounts one network may create per hour.
+SIGNUP_MAX_PER_HOUR = "20"
+# Test-only: when "1", signup/resend responses include the verification token so tests can use it
+# without an email provider. Never enable in production.
+# EMAIL_DEBUG = "1"
+
+# Secrets (never in this file — set with `npx wrangler secret put <NAME>`):
+#   TURNSTILE_SECRET   — Turnstile secret key (when CAPTCHA_ENABLED is true)
+#   RESEND_API_KEY     — Resend API key for verification emails (without it links are only logged)
+#   TESTER_EMAILS      — accounts that get the testing tools and the usage dashboard

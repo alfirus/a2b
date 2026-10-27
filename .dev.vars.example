@@ -1,0 +1,25 @@
+# Local development settings (read by `npx wrangler dev`). Copy to `.dev.vars` and fill in.
+# Production uses the same names as wrangler vars/secrets — see wrangler.toml.
+
+# Turnstile CAPTCHA on signup (and on logins once a password looks guessed).
+# Get the keys at https://dash.cloudflare.com/?to=/:account/turnstile (any site using the widget is fine).
+CAPTCHA_ENABLED=false
+TURNSTILE_SITEKEY=
+# npx wrangler secret put TURNSTILE_SECRET   (local: add TURNSTILE_SECRET=... to .dev.vars instead)
+
+# Email verification for new accounts: off | optional | required.
+EMAIL_VERIFICATION=optional
+# Where the verification email comes from, and the base URL the link points back to.
+EMAIL_FROM="A2B <noreply@example.com>"
+APP_BASE_URL=http://localhost:8787
+# npx wrangler secret put RESEND_API_KEY   (from https://resend.com/api-keys; without it links are only logged)
+# Local: add RESEND_API_KEY=... to .dev.vars instead.
+
+# Two-factor logins (TOTP authenticator apps): off | optional | required.
+TWO_FACTOR=optional
+
+# How many accounts one network may create per hour.
+SIGNUP_MAX_PER_HOUR=20
+
+# Local tests only: include the verification token in signup/resend responses. Never set in production.
+EMAIL_DEBUG=1
