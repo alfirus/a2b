@@ -7,7 +7,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL, pass_hash TEXT NOT NULL, pass_salt TEXT NOT NULL,
   points INTEGER NOT NULL DEFAULT 0, home TEXT, work TEXT, settings TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL,
-  email_verified INTEGER NOT NULL DEFAULT 1, totp_secret TEXT, totp_enabled INTEGER NOT NULL DEFAULT 0
+  totp_secret TEXT, totp_enabled INTEGER NOT NULL DEFAULT 0, totp_last_step INTEGER
 );
 CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
@@ -30,11 +30,7 @@ CREATE TABLE IF NOT EXISTS trips (
 CREATE INDEX IF NOT EXISTS trips_user ON trips (user_id, updated_at);
 CREATE TABLE IF NOT EXISTS login_failures (email TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS login_failures_email ON login_failures (email, at);
-CREATE TABLE IF NOT EXISTS email_verifications (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, email TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS email_verifications_user ON email_verifications (user_id, created_at);
-CREATE TABLE IF NOT EXISTS auth_challenges (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, purpose TEXT NOT NULL DEFAULT 'totp', secret TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS signup_attempts (ip TEXT NOT NULL, at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS signup_attempts_ip ON signup_attempts (ip, at);
+CREATE TABLE IF NOT EXISTS auth_challenges (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, purpose TEXT NOT NULL DEFAULT 'totp', secret TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS toll_plazas (key TEXT PRIMARY KEY, info TEXT NOT NULL, fetched_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS closure_blocks (report_id INTEGER PRIMARY KEY, lat REAL NOT NULL, lng REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS presence (device TEXT PRIMARY KEY, user_id INTEGER, admitted INTEGER NOT NULL, last_seen INTEGER NOT NULL);
@@ -42,7 +38,18 @@ CREATE INDEX IF NOT EXISTS presence_seen ON presence (last_seen);
 CREATE TABLE IF NOT EXISTS usage_daily (day TEXT PRIMARY KEY, peak_active INTEGER NOT NULL DEFAULT 0, peak_at INTEGER, signups INTEGER NOT NULL DEFAULT 0, routes INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, tomtom INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage_devices (day TEXT NOT NULL, device TEXT NOT NULL, account INTEGER NOT NULL DEFAULT 0, turned_away INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, device));
 CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, user_id INTEGER, device TEXT, message TEXT NOT NULL, app TEXT, ua TEXT, created_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS feedback_device ON feedback (device, created_at)
+CREATE INDEX IF NOT EXISTS feedback_device ON feedback (device, created_at);
+CREATE TABLE IF NOT EXISTS probe_segments (
+  segment TEXT PRIMARY KEY, lat REAL NOT NULL, lng REAL NOT NULL, dir INTEGER NOT NULL,
+  avg_speed REAL NOT NULL, probes INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS probe_segments_live ON probe_segments (updated_at, lat, lng);
+CREATE TABLE IF NOT EXISTS probe_devices (
+  segment TEXT NOT NULL, device_hash TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (segment, device_hash)
+);
+CREATE INDEX IF NOT EXISTS probe_devices_live ON probe_devices (updated_at);
+CREATE TABLE IF NOT EXISTS probe_limits (device_hash TEXT PRIMARY KEY, last_at INTEGER NOT NULL, day TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0)
 `;
 
 let ready = null;

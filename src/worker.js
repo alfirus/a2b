@@ -6,9 +6,8 @@ import {
   hashPassword, verifyPassword, normalizeEmail, validatePassword, cleanName, createSession, currentUser, destroySession,
   sessionCookie, publicUser, randomToken, sha256,
 } from './lib/auth.js';
-import { captchaEnabled, captchaSiteKey, verifyCaptcha } from './lib/captcha.js';
-import { emailVerificationMode, emailVerificationRequired, sendVerificationEmail } from './lib/email.js';
-import { generateSecret, otpauthURL, verifyTOTP, twoFactorMode } from './lib/twofactor.js';
+import { generateSecret, otpauthURL, verifyTOTP, verifyTOTPStep, twoFactorMode } from './lib/twofactor.js';
+import { probesRepo, annotateWithProbes, PROBE_RETENTION_MS } from './lib/probes.js';
 import { searchPlaces, reverseGeocode, fetchRoutes, fetchRouteAttributes, annotateWithReports, httpError, bbox, roadMidpoint, MAX_EXCLUDE } from './lib/providers.js';
 import { constructionTwins } from './lib/construction.js';
 import { liveTraffic, applyTraffic } from './lib/traffic.js';
@@ -22,14 +21,11 @@ import { usageRepo, USAGE_DAYS, dayOf } from './lib/usage.js';
 const MAX_BODY = 64 * 1024;
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const LOGIN_MAX_FAILURES = 8;
-const LOGIN_CAPTCHA_AFTER_FAILURES = 3; // once a password looks guessed, logins also need the CAPTCHA
-const VERIFY_TTL_MS = 24 * 3600_000; // email links last a day
 const CHALLENGE_TTL_MS = 10 * 60_000; // the second login step lasts ten minutes
-const SIGNUP_WINDOW_MS = 3600_000; // signup attempts are counted per hour, per network
-const RESEND_MAX_PER_HOUR = 5;
+const CHALLENGE_MAX_ATTEMPTS = 5; // wrong codes per challenge, then it dies and the driver logs in again
 const RECENTS_KEPT = 20;
 const FULL_MESSAGE = 'A2B is full right now. You will be let in when a spot opens.';
-const SETTINGS_KEYS = { voice: 'boolean', speed_warning: 'boolean', units: ['metric', 'imperial'], theme: ['auto', 'day', 'night'], avoid_tolls: 'boolean', avoid_highways: 'boolean', avoid_ferries: 'boolean', alerts: 'boolean' };
+const SETTINGS_KEYS = { voice: 'boolean', speed_warning: 'boolean', units: ['metric', 'imperial'], theme: ['auto', 'day', 'night'], avoid_tolls: 'boolean', avoid_highways: 'boolean', avoid_ferries: 'boolean', alerts: 'boolean', traffic_probe: 'boolean' };
 
 export default {
   async fetch(request, env) {
@@ -55,12 +51,13 @@ export default {
       env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now),
       env.DB.prepare('DELETE FROM trips WHERE updated_at < ?').bind(now - 2 * 86400_000),
       env.DB.prepare('DELETE FROM login_failures WHERE at < ?').bind(now - LOGIN_WINDOW_MS),
-      env.DB.prepare('DELETE FROM email_verifications WHERE expires_at < ?').bind(now),
       env.DB.prepare('DELETE FROM auth_challenges WHERE expires_at < ?').bind(now),
-      env.DB.prepare('DELETE FROM signup_attempts WHERE at < ?').bind(now - SIGNUP_WINDOW_MS),
       env.DB.prepare('DELETE FROM presence WHERE last_seen < ?').bind(now - 86400_000),
       env.DB.prepare('DELETE FROM usage_devices WHERE day < ?').bind(dayOf(now - USAGE_DAYS * 86400_000)),
       env.DB.prepare('DELETE FROM usage_daily WHERE day < ?').bind(dayOf(now - USAGE_DAYS * 86400_000)),
+      env.DB.prepare('DELETE FROM probe_segments WHERE updated_at < ?').bind(now - PROBE_RETENTION_MS),
+      env.DB.prepare('DELETE FROM probe_devices WHERE updated_at < ?').bind(now - PROBE_RETENTION_MS),
+      env.DB.prepare('DELETE FROM probe_limits WHERE last_at < ?').bind(now - PROBE_RETENTION_MS),
     ]);
   },
 };
@@ -132,21 +129,16 @@ async function route(request, env, url) {
     return json({ ok: true });
   }
 
-  // Public knobs the sign-in screen reads: which signup/login checks are on.
+  // Public knob the sign-in screen reads: whether two-factor login is on.
   if (path === '/api/config' && method === 'GET') {
     return json({
-      captcha: { enabled: captchaEnabled(env), siteKey: captchaSiteKey(env) },
-      emailVerification: { mode: emailVerificationMode(env), required: emailVerificationRequired(env) },
       twoFactor: { mode: twoFactorMode(env) },
     });
   }
 
   // ---------- Accounts ----------
   if (path === '/api/auth/signup' && method === 'POST') {
-    const ip = clientIp(request);
-    await checkSignupThrottle(db, env, ip);
     const body = await readJson(request);
-    await verifyCaptcha(env, body.captcha, ip);
     const email = normalizeEmail(body.email);
     if (!email) throw httpError('Enter a valid email address.', 400);
     const bad = validatePassword(body.password);
@@ -154,51 +146,28 @@ async function route(request, env, url) {
     if (await db.prepare('SELECT 1 FROM users WHERE email = ?').bind(email).first()) throw httpError('An account with this email already exists. Log in instead.', 409);
     const { hash, salt } = await hashPassword(body.password);
     const settings = cleanSettings(body.settings ?? {});
-    const mode = emailVerificationMode(env);
-    const mustVerify = mode === 'required';
     const row = await db
-      .prepare('INSERT INTO users (email, name, pass_hash, pass_salt, settings, email_verified, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *')
-      .bind(email, cleanName(body.name, email), hash, salt, JSON.stringify(settings), mustVerify ? 0 : 1, Date.now())
+      .prepare('INSERT INTO users (email, name, pass_hash, pass_salt, settings, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING *')
+      .bind(email, cleanName(body.name, email), hash, salt, JSON.stringify(settings), Date.now())
       .first();
     await count('signups');
-    // A verification email goes out whenever verification is on; without an email provider
-    // configured the link is only logged server-side (see src/lib/email.js).
-    let verificationToken;
-    if (mode !== 'off') {
-      try {
-        verificationToken = await issueVerification(db, env, request, row);
-      } catch (e) {
-        if (e.status === 429) throw e;
-        console.warn('verification email failed:', e?.message ?? e);
-      }
-    }
-    const debug = env.EMAIL_DEBUG === '1' && verificationToken ? { verificationToken } : {};
-    if (mustVerify) {
-      // No session yet: the link in the email logs them in.
-      return json({ user: publicUser(row), verificationRequired: true, verificationSent: true, ...debug }, 201);
-    }
-    return withSession(request, db, row, 201, mode === 'optional' ? { verificationSent: true, ...debug } : debug);
+    return withSession(request, db, row, 201);
   }
 
   if (path === '/api/auth/login' && method === 'POST') {
-    const ip = clientIp(request);
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     if (!email) throw httpError('Wrong email or password.', 401);
     const recent = await db.prepare('SELECT COUNT(*) AS n FROM login_failures WHERE email = ? AND at > ?').bind(email, Date.now() - LOGIN_WINDOW_MS).first();
     if (recent.n >= LOGIN_MAX_FAILURES) throw httpError('Too many wrong passwords. Try again in 15 minutes.', 429);
-    if (captchaEnabled(env) && recent.n >= LOGIN_CAPTCHA_AFTER_FAILURES) await verifyCaptcha(env, body.captcha, ip);
     const row = await db.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
     if (!row || !(await verifyPassword(String(body.password ?? ''), row.pass_hash, row.pass_salt))) {
       await db.prepare('INSERT INTO login_failures (email, at) VALUES (?, ?)').bind(email, Date.now()).run();
       throw httpError('Wrong email or password.', 401);
     }
-    if (emailVerificationRequired(env) && !row.email_verified) {
-      throw Object.assign(httpError('Check your email for the verification link, then log in.', 403), { code: 'email_not_verified' });
-    }
-    await db.prepare('DELETE FROM login_failures WHERE email = ?').bind(email).run();
     const tf = twoFactorMode(env);
     if (tf !== 'off' && row.totp_enabled) {
+      // No session yet: failures stay counted, so wrong codes lock the account like wrong passwords do.
       return json({ two_factor_required: true, challenge_id: await issueChallenge(db, row.id, 'totp') }, 202);
     }
     if (tf === 'required' && !row.totp_enabled) {
@@ -207,43 +176,8 @@ async function route(request, env, url) {
       const challenge_id = await issueChallenge(db, row.id, 'totp_setup', secret);
       return json({ two_factor_setup_required: true, challenge_id, secret, otpauth_url: otpauthURL(secret, row.email) }, 202);
     }
+    await db.prepare('DELETE FROM login_failures WHERE email = ?').bind(email).run();
     return withSession(request, db, row, 200);
-  }
-
-  // The link in the verification email lands here (see public/app.js): it confirms the
-  // address and logs the driver straight in.
-  if (path === '/api/auth/verify' && method === 'GET') {
-    const token = String(url.searchParams.get('token') ?? '');
-    if (!/^[0-9a-f]{64}$/.test(token)) throw httpError('That verification link is wrong. Ask for a new email below.', 400);
-    const now = Date.now();
-    const pending = await db.prepare('SELECT * FROM email_verifications WHERE token_hash = ?').bind(await sha256(token)).first();
-    if (!pending || pending.expires_at <= now) {
-      if (pending) await db.prepare('DELETE FROM email_verifications WHERE token_hash = ?').bind(pending.token_hash).run();
-      throw httpError('That verification link expired. Ask for a new email below.', 400);
-    }
-    const row = await db.prepare('UPDATE users SET email_verified = 1 WHERE id = ? RETURNING *').bind(pending.user_id).first();
-    await db.prepare('DELETE FROM email_verifications WHERE user_id = ?').bind(pending.user_id).run();
-    return withSession(request, db, row, 200);
-  }
-
-  if (path === '/api/auth/resend' && method === 'POST') {
-    const body = await readJson(request);
-    const email = normalizeEmail(body.email);
-    let verificationToken;
-    if (email) {
-      const row = await db.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
-      if (row && !row.email_verified) {
-        try {
-          verificationToken = await issueVerification(db, env, request, row);
-        } catch (e) {
-          if (e.status === 429) throw e;
-          console.warn('verification email failed:', e?.message ?? e);
-        }
-      }
-    }
-    const out = { ok: true };
-    if (env.EMAIL_DEBUG === '1' && verificationToken) out.verificationToken = verificationToken;
-    return json(out);
   }
 
   // ---------- Two-factor authentication (TOTP authenticator apps) ----------
@@ -277,7 +211,7 @@ async function route(request, env, url) {
     const okCode = body.code && u.totp_secret && (await verifyTOTP(u.totp_secret, body.code));
     const okPass = body.current_password && (await verifyPassword(String(body.current_password), u.pass_hash, u.pass_salt));
     if (!okCode && !okPass) throw httpError('Enter a current code or your password to turn it off.', 403);
-    const row = await db.prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = ? RETURNING *').bind(u.id).first();
+    const row = await db.prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0, totp_last_step = NULL WHERE id = ? RETURNING *').bind(u.id).first();
     return json({ ok: true, user: publicUser(row) });
   }
 
@@ -294,13 +228,26 @@ async function route(request, env, url) {
     }
     const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(ch.user_id).first();
     const secret = ch.purpose === 'totp_setup' ? ch.secret : row?.totp_secret;
-    if (!row || !secret || !(await verifyTOTP(secret, body.code))) {
+    // verifyTOTPStep returns the matched 30 s step (or null), so a code can't be replayed in a later challenge.
+    const step = secret ? await verifyTOTPStep(secret, body.code) : null;
+    if (!row || !secret || step == null || (row.totp_last_step != null && step <= row.totp_last_step)) {
+      // A wrong code counts like a wrong password: after a few, the account locks for a while,
+      // and the challenge dies after a few wrong codes, so it can't be guessed one code at a time.
+      await db.prepare('INSERT INTO login_failures (email, at) VALUES (?, ?)').bind(row?.email ?? '', Date.now()).run();
+      const attempts = (ch.attempts ?? 0) + 1;
+      if (attempts >= CHALLENGE_MAX_ATTEMPTS) {
+        await db.prepare('DELETE FROM auth_challenges WHERE token_hash = ?').bind(ch.token_hash).run();
+        throw Object.assign(httpError('Too many wrong codes. Log in again.', 429), { code: 'totp_attempts' });
+      }
+      await db.prepare('UPDATE auth_challenges SET attempts = ? WHERE token_hash = ?').bind(attempts, ch.token_hash).run();
       throw Object.assign(httpError('That code is wrong. Check your authenticator app and try again.', 401), { code: 'totp_invalid' });
     }
     await db.prepare('DELETE FROM auth_challenges WHERE token_hash = ?').bind(ch.token_hash).run();
     let user = row;
     if (ch.purpose === 'totp_setup' && !row.totp_enabled) {
-      user = await db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ? RETURNING *').bind(secret, row.id).first();
+      user = await db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 1, totp_last_step = ? WHERE id = ? RETURNING *').bind(secret, step, row.id).first();
+    } else {
+      user = await db.prepare('UPDATE users SET totp_last_step = ? WHERE id = ? RETURNING *').bind(step, row.id).first();
     }
     await db.prepare('DELETE FROM login_failures WHERE email = ?').bind(row.email).run();
     return withSession(request, db, user, 200);
@@ -345,10 +292,9 @@ async function route(request, env, url) {
       db.prepare('DELETE FROM trips WHERE user_id = ?').bind(u.id),
       db.prepare('DELETE FROM votes WHERE user_id = ?').bind(u.id),
       db.prepare('DELETE FROM feedback WHERE user_id = ?').bind(u.id),
-      db.prepare('DELETE FROM email_verifications WHERE user_id = ?').bind(u.id),
       db.prepare('DELETE FROM auth_challenges WHERE user_id = ?').bind(u.id),
       db.prepare('UPDATE reports SET removed = 1 WHERE user_id = ?').bind(u.id),
-      db.prepare("UPDATE users SET email = 'deleted-' || id || '@invalid', name = 'Former driver', pass_hash = '', pass_salt = '', home = NULL, work = NULL, email_verified = 0, totp_secret = NULL, totp_enabled = 0 WHERE id = ?").bind(u.id),
+      db.prepare("UPDATE users SET email = 'deleted-' || id || '@invalid', name = 'Former driver', pass_hash = '', pass_salt = '', home = NULL, work = NULL, totp_secret = NULL, totp_enabled = 0, totp_last_step = NULL WHERE id = ?").bind(u.id),
     ]);
     return json({ ok: true }, 200, { 'set-cookie': sessionCookie(request, null) });
   }
@@ -520,8 +466,11 @@ async function route(request, env, url) {
     routes.forEach((r, i) => {
       if (twins[i]?.length) r.warning = 'construction';
     });
-    const [live] = await Promise.all([
-      reports.inBox(bbox(routes.flatMap((r) => [r.coords[0], r.coords.at(-1)]).concat([from, to]), 0.2), user?.id),
+    const routeArea = bbox(routes.flatMap((r) => [r.coords[0], r.coords.at(-1)]).concat([from, to]), 0.2);
+    const [live, probeSegs] = await Promise.all([
+      reports.inBox(routeArea, user?.id),
+      // Congested blocks from opted-in drivers; a slow lookup never holds up the route.
+      probesRepo(db).congested(routeArea).catch(() => []),
       // Speed limits and toll plazas are nice-to-haves: a slow or failing lookup never holds up the route.
       ...routes.map(async (r) => {
         const a = await fetchRouteAttributes(env, r.shapes, r.coords).catch(() => null);
@@ -544,6 +493,7 @@ async function route(request, env, url) {
     const details = await plazaDetails(db, plazas.map(([, p]) => p)).catch(() => []);
     plazas.forEach(([t], i) => Object.assign(t, details[i] ?? {}));
     annotateWithReports(routes, live);
+    annotateWithProbes(routes, probeSegs, routeArea);
     routes.sort((a, b) => a.duration - b.duration);
     await count('routes');
     return json({ routes, closures_avoided: closuresIgnored ? 0 : exclude.length, closures_ignored: closuresIgnored, construction_avoided: constructionAvoided });
@@ -569,6 +519,19 @@ async function route(request, env, url) {
     const u = needUser();
     const body = await readJson(request);
     return json(await reports.vote(u, Number(parts[2]), body.vote));
+  }
+
+  // ---------- Opt-in probe traffic ----------
+  // Small batches of recent speed fixes from drivers who switched it on. Each batch must repeat the
+  // consent flag; the fixes are folded into anonymous block totals and never stored. Guests may
+  // contribute too: only the device id (hashed, for rate limiting) is needed, never an account.
+  if (path === '/api/probe' && method === 'POST') {
+    if (!validDevice(device)) throw httpError('Missing device id.', 400);
+    await needSpot(); // writes only come from checked-in devices, like every other upstream- or DB-heavy endpoint
+    const body = await readJson(request);
+    if (body.consent !== true) throw httpError('Probe sharing needs consent: switch it on in Settings first.', 403);
+    const { stored } = await probesRepo(db).contribute(await sha256(device), body.points);
+    return json({ ok: true, stored }, 202);
   }
 
   // ---------- Shared drives (live ETA link) ----------
@@ -629,47 +592,6 @@ async function route(request, env, url) {
 async function withSession(request, db, row, status, extra = {}) {
   const { token, expires } = await createSession(db, row.id);
   return json({ user: publicUser(row), ...extra }, status, { 'set-cookie': sessionCookie(request, token, expires) });
-}
-
-function clientIp(request) {
-  const h = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || '';
-  return h.split(',')[0].trim().slice(0, 80);
-}
-
-function signupLimit(env) {
-  const n = Number(env.SIGNUP_MAX_PER_HOUR);
-  return Number.isInteger(n) && n > 0 ? n : 20;
-}
-
-// At most a handful of accounts per hour from one network, so open signup can't be farmed.
-async function checkSignupThrottle(db, env, ip) {
-  if (!ip) return;
-  const now = Date.now();
-  const recent = await db.prepare('SELECT COUNT(*) AS n FROM signup_attempts WHERE ip = ? AND at > ?').bind(ip, now - SIGNUP_WINDOW_MS).first();
-  await db.prepare('INSERT INTO signup_attempts (ip, at) VALUES (?, ?)').bind(ip, now).run();
-  if (recent.n >= signupLimit(env)) {
-    throw Object.assign(httpError('Too many sign-ups from this network. Try again in an hour.', 429), { code: 'signup_throttled' });
-  }
-}
-
-// A fresh verification email: old links die, at most a few an hour per account.
-async function issueVerification(db, env, request, user) {
-  const now = Date.now();
-  const recent = await db
-    .prepare('SELECT COUNT(*) AS n FROM email_verifications WHERE user_id = ? AND created_at > ?')
-    .bind(user.id, now - 3600_000)
-    .first();
-  if (recent.n >= RESEND_MAX_PER_HOUR) {
-    throw Object.assign(httpError('Too many verification emails. Try again in an hour.', 429), { code: 'resend_throttled' });
-  }
-  await db.prepare('DELETE FROM email_verifications WHERE user_id = ?').bind(user.id).run();
-  const token = randomToken(32);
-  await db
-    .prepare('INSERT INTO email_verifications (token_hash, user_id, email, created_at, expires_at) VALUES (?, ?, ?, ?, ?)')
-    .bind(await sha256(token), user.id, user.email, now, now + VERIFY_TTL_MS)
-    .run();
-  await sendVerificationEmail(env, user.email, token, request);
-  return token;
 }
 
 // The first half of a two-factor login: the app answers with the code for this challenge id.

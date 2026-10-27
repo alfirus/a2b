@@ -100,7 +100,6 @@ export function publicUser(u) {
     email: u.email,
     name: u.name,
     points: u.points,
-    email_verified: u.email_verified !== 0,
     totp_enabled: u.totp_enabled === 1,
     home: u.home ? JSON.parse(u.home) : null,
     work: u.work ? JSON.parse(u.work) : null,

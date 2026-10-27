@@ -4,6 +4,7 @@
 // "My A2B" menu, sign in / sign up, settings, saved places, leaderboard and about.
 
 import { $, state, api, appConfig, local, toast, esc, initials, saveSettings, setHomeWork, removePlace, renamePlace, armBack, speak } from './core.js';
+import { stopSharing } from './probe.js';
 import { pickVoice } from './voice.js';
 import { appVersion } from './update.js';
 import { VEHICLES, COLORS, DEFAULT_COLOR } from './vehicle3d.js';
@@ -14,7 +15,6 @@ let authMode = 'signup';
 let authReason = null;
 let installPrompt = null;
 let pendingChallenge = null; // second login step: { id, setup, secret, otpauth_url }
-let turnstileWidget = null;
 
 export function initPanels(callbacks) {
   ctx = callbacks;
@@ -27,15 +27,6 @@ export function initPanels(callbacks) {
   $('m-install').onclick = install;
   $('auth-switch').onclick = () => setAuthMode(authMode === 'signup' ? 'login' : 'signup');
   $('auth-form').onsubmit = submitAuth;
-  $('auth-resend').onclick = async () => {
-    const email = new FormData($('auth-form')).get('email');
-    try {
-      await api('/api/auth/resend', { method: 'POST', body: { email } });
-      toast('Email sent — if that address still needs verifying, the link is on its way.');
-    } catch (e) {
-      toast(e.message);
-    }
-  };
   window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
     installPrompt = e;
@@ -121,49 +112,8 @@ function setAuthMode(mode) {
   document.querySelector('#auth-form .name-row').classList.toggle('hidden', !signup);
   document.querySelector('#auth-form [name=password]').autocomplete = signup ? 'new-password' : 'current-password';
   $('auth-2fa-row').classList.add('hidden');
-  $('auth-verify-note').classList.add('hidden');
-  $('auth-resend').classList.add('hidden');
+  $('auth-note').classList.add('hidden');
   $('auth-error').classList.add('hidden');
-  renderCaptcha();
-}
-
-// Cloudflare Turnstile, only when the server switched it on (see /api/config).
-function renderCaptcha() {
-  const box = $('captcha-box');
-  box.innerHTML = '';
-  box.classList.add('hidden');
-  turnstileWidget = null;
-  const cfg = appConfig?.captcha;
-  if (!cfg?.enabled || !cfg?.siteKey) return;
-  box.classList.remove('hidden');
-  const render = () => {
-    try {
-      if (window.turnstile && box.isConnected) turnstileWidget = window.turnstile.render(box, { sitekey: cfg.siteKey });
-    } catch {}
-  };
-  if (window.turnstile) render();
-  else if (!document.querySelector('script[data-turnstile]')) {
-    const s = document.createElement('script');
-    s.dataset.turnstile = '1';
-    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-    s.defer = true;
-    s.onload = render;
-    document.head.appendChild(s);
-  }
-}
-
-function captchaToken() {
-  try {
-    return window.turnstile && turnstileWidget !== null ? window.turnstile.getResponse(turnstileWidget) : '';
-  } catch {
-    return '';
-  }
-}
-
-function resetCaptcha() {
-  try {
-    if (window.turnstile && turnstileWidget !== null) window.turnstile.reset(turnstileWidget);
-  } catch {}
 }
 
 async function submitAuth(e) {
@@ -188,25 +138,14 @@ async function submitAuth(e) {
     }
     const body = { email: f.get('email'), password: f.get('password') };
     if (authMode === 'signup') Object.assign(body, { name: f.get('name'), settings: state.settings });
-    const captcha = captchaToken();
-    if (captcha) body.captcha = captcha;
     const data = await api(`/api/auth/${authMode}`, { method: 'POST', body });
-    if (data.verificationRequired) {
-      // The account exists, but the inbox check comes first.
-      setAuthMode('login');
-      $('auth-verify-note').textContent = 'Check your email for the verification link (it lasts a day), then log in below.';
-      $('auth-verify-note').classList.remove('hidden');
-      $('auth-resend').classList.remove('hidden');
-      toast('Check your email to verify the account');
-      return;
-    }
     if (data.two_factor_required || data.two_factor_setup_required) {
       pendingChallenge = { id: data.challenge_id, setup: Boolean(data.two_factor_setup_required) };
       $('auth-2fa-row').classList.remove('hidden');
       document.querySelector('#auth-form .name-row').classList.add('hidden');
       btn.textContent = 'Verify code';
       $('auth-switch').textContent = 'Back to log in';
-      const note = $('auth-verify-note');
+      const note = $('auth-note');
       if (data.two_factor_setup_required) {
         note.innerHTML = `Two-factor is now required: add this secret to your authenticator app, then enter the code.<br><b>${esc(data.secret)}</b>`;
       } else {
@@ -234,31 +173,12 @@ async function submitAuth(e) {
     toast(authMode === 'signup' ? `Welcome, ${state.user.name}!` : `Welcome back, ${state.user.name}!`);
     if (authReason === 'report') $('btn-report').click();
   } catch (err) {
-    if (err.code === 'email_not_verified') {
-      $('auth-verify-note').textContent = 'That email is not verified yet. Open the link in your inbox, or send it again below.';
-      $('auth-verify-note').classList.remove('hidden');
-      $('auth-resend').classList.remove('hidden');
-    }
     $('auth-error').textContent = err.message;
     $('auth-error').classList.remove('hidden');
   } finally {
-    resetCaptcha();
     fields.forEach((x) => (x.disabled = false));
     btn.classList.remove('busy');
     btn.textContent = pendingChallenge ? 'Verify code' : label;
-  }
-}
-
-// The /verify/<token> link from the email lands here (see public/app.js).
-export async function verifyEmailToken(token) {
-  try {
-    await api(`/api/auth/verify?token=${encodeURIComponent(token)}`, { method: 'GET' });
-    await refreshMe();
-    await ctx.onUserChanged();
-    toast(`Email verified — welcome, ${state.user.name}!`);
-  } catch (err) {
-    toast(err.message);
-    openAuth(null, 'login');
   }
 }
 
@@ -325,6 +245,31 @@ function choiceRow(key, label, options) {
     .join('')}</div></div>`;
 }
 
+// What sharing speeds really means, in plain words, before the driver says yes. Off until then.
+export function openProbeConsent() {
+  const body = openPanel('Share speeds for live traffic', `
+    <div class="set-group"><h3>How it works</h3>
+      <p class="hint" style="padding:4px 18px">While you drive, the app sends a small batch of recent fixes about
+      every 30 seconds: your position rounded to about 100&nbsp;m on this phone, speed, direction and time. The server folds
+      them straight into anonymous per-street totals (street block, direction, average speed, how many fixes from
+      how many drivers)
+      and never stores your raw trail. Totals older than a day are deleted every night.</p>
+      <p class="hint" style="padding:4px 18px">Streets where enough drivers crawl show as slow for everyone, and
+      add to route times next to jams drivers report by hand. Turn the switch off any time to stop sharing.</p>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn ghost" id="probe-no">Not now</button>
+      <button class="btn primary" id="probe-yes">Share my speeds</button>
+    </div>`);
+  body.querySelector('#probe-no').onclick = () => openSettings();
+  body.querySelector('#probe-yes').onclick = async () => {
+    local.set('probeConsent', true);
+    await saveSettings({ traffic_probe: true });
+    toast('Thanks, you are helping everyone see slow traffic.');
+    openSettings();
+  };
+}
+
 export function openSettings() {
   const u = state.user;
   const body = openPanel('Settings', `
@@ -339,6 +284,9 @@ export function openSettings() {
       ${toggleRow('avoid_highways', 'Avoid highways')}
       ${toggleRow('avoid_ferries', 'Avoid ferries')}
       <p class="hint" style="padding:4px 18px">Roads that other drivers report as closed are avoided automatically.</p>
+    </div>
+    <div class="set-group"><h3>Traffic</h3>
+      ${toggleRow('traffic_probe', 'Share speeds for live traffic', 'Off by default. Helps everyone see slow traffic.')}
     </div>
     <div class="set-group"><h3>Display</h3>
       ${choiceRow('units', 'Units', [['metric', 'km'], ['imperial', 'miles']])}
@@ -356,7 +304,6 @@ export function openSettings() {
     </div>
     ${u ? `<div class="set-group"><h3>Account</h3>
       <button class="set-row" id="s-name"><span>Display name<small>${esc(u.name)}</small></span></button>
-      ${appConfig?.emailVerification?.mode && appConfig.emailVerification.mode !== 'off' && !u.email_verified ? `<button class="set-row" id="s-verify"><span>Verify email<small>${esc(u.email)} — open the link from your inbox</small></span></button>` : ''}
       ${appConfig?.twoFactor?.mode && appConfig.twoFactor.mode !== 'off' ? `<button class="set-row" id="s-2fa"><span>Two-factor authentication<small>${u.totp_enabled ? 'On: a code is asked at login' : 'Off: add an extra code at login'}</small></span></button>` : ''}
       <button class="set-row" id="s-pass"><span>Change password</span></button>
       <button class="set-row" id="s-delete" style="color:var(--danger)"><span>Delete account</span></button>
@@ -375,6 +322,13 @@ export function openSettings() {
 
   body.querySelectorAll('[data-set]').forEach((c) => {
     c.onchange = async () => {
+      // Traffic sharing needs an explicit yes on the consent screen, not just a flipped switch.
+      if (c.dataset.set === 'traffic_probe' && c.checked && local.get('probeConsent', false) !== true) {
+        c.checked = false;
+        openProbeConsent();
+        return;
+      }
+      if (c.dataset.set === 'traffic_probe' && !c.checked) stopSharing();
       await saveSettings({ [c.dataset.set]: c.checked });
       if (c.dataset.set === 'voice') ctx.refreshSound();
     };
@@ -433,14 +387,6 @@ export function openSettings() {
         state.user = (await api('/api/me', { method: 'PATCH', body: { name } })).user;
         renderAvatar();
         openSettings();
-      } catch (e) {
-        toast(e.message);
-      }
-    };
-    if ($('s-verify')) $('s-verify').onclick = async () => {
-      try {
-        await api('/api/auth/resend', { method: 'POST', body: { email: u.email } });
-        toast('Email sent — open the link in your inbox.');
       } catch (e) {
         toast(e.message);
       }

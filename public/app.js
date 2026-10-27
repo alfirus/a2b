@@ -15,8 +15,9 @@ import {
   isSaved, setHomeWork, armBack,
 } from './core.js';
 import { MAP_THEMES, BASE_STYLES, applyMapTheme } from './map-themes.js';
-import { initPanels, openMenu, openAuth, openSettings, renderAvatar, refreshMe, verifyEmailToken } from './panels.js';
+import { initPanels, openMenu, openAuth, openSettings, renderAvatar, refreshMe } from './panels.js';
 import { startPresence, checkIn } from './presence.js';
+import { noteProbeFix, startProbeSender, discardProbeBuffer } from './probe.js';
 import { welcome, hideSplash } from './welcome.js';
 import { watchUpdates, updateCheckpoint } from './update.js';
 
@@ -197,18 +198,14 @@ async function boot() {
   else welcome(startLocation);
   setInterval(() => loadReports(true), REPORT_REFRESH_MS);
   setInterval(() => applyTheme(), 5 * 60_000);
+  startProbeSender(); // opt-in traffic sharing batches; silent unless the driver said yes
 
   await refreshMe();
   await loadConfig();
   await onUserChanged();
 
-  // Deep links: /drive/<token> watches a shared drive; /verify/<token> confirms a new email;
+  // Deep links: /drive/<token> watches a shared drive;
   // /?to=lat,lng&name= opens a destination.
-  const v = location.pathname.match(/^\/verify\/([a-z0-9]+)$/i);
-  if (v) {
-    history.replaceState(null, '', '/');
-    await verifyEmailToken(v[1]);
-  }
   const m = location.pathname.match(/^\/drive\/([a-z0-9]+)$/i);
   if (m) return startWatching(m[1]); // watching a friend's drive doesn't take one of the spots
   startPresence({ driving: () => mode === 'drive', signUp: () => openAuth(null, 'signup') });
@@ -534,17 +531,19 @@ function drawDriveLine() {
 }
 
 // The selected route's colours along its length: muted where already driven (up to `driven`, a fraction of the
-// length), then the route colour, with live-traffic jams in amber to deep red.
+// length), then the route colour, with live-traffic and driver-speed jams in amber to deep red.
 function routeColours(route, driven) {
   const c = ROUTE[themeNow];
-  const jams = route?.traffic?.jams ?? [];
+  const jams = [...(route?.traffic?.jams ?? []), ...(route?.probe_jams ?? [])];
   const cuts = [...new Set([0, driven, ...jams.flatMap((j) => [j.from, j.to])])].filter((x) => x >= 0 && x < 1).sort((x, y) => x - y);
-  const colourAt = (x) => (x < driven ? c.driven : JAM_COLOURS[jams.find((j) => j.from <= x && x < j.to)?.level] ?? c.main);
+  const levelAt = (x) => Math.max(0, ...jams.filter((j) => j.from <= x && x < j.to).map((j) => j.level));
+  const colourAt = (x) => (x < driven ? c.driven : JAM_COLOURS[levelAt(x)] ?? c.main);
   const expr = ['step', ['line-progress'], colourAt(0)];
   cuts.forEach((at, i) => {
     const colour = colourAt((at + (cuts[i + 1] ?? 1)) / 2);
     if (at > 0 && colour !== expr.at(-1)) expr.push(at, colour);
   });
+  if (expr.length === 3) expr.push(1, expr[2]); // one colour all along: a step needs at least one stop
   return expr;
 }
 
@@ -604,6 +603,8 @@ function estSpeed(prev, lngLat, t) {
 
 function handleFix(fix, first = false) {
   state.pos = fix;
+  // Traffic sharing only buffers real drives: walking, browsing the map, and demo drives never become traffic.
+  if (mode === 'drive' && !sim) noteProbeFix(fix);
   local.set('lastPos', fix.lngLat.map((v) => Math.round(v * 1e4) / 1e4));
   if (mode === 'watch') return; // the viewer's own position isn't part of someone else's drive
   if (!carMarker._map) carMarker.setLngLat(fix.lngLat).addTo(map);
@@ -1221,8 +1222,10 @@ function renderRouteOptions() {
     if (r.ferry) badges.push('<span class="badge warn">Ferry</span>');
     const reps = (r.reports ?? []).length;
     if (reps) badges.push(`<span class="badge">${reps} report${reps > 1 ? 's' : ''}</span>`);
-    const late = (r.traffic?.delay ?? 0) + (r.delay ?? 0);
-    if (late >= 60) badges.push(`<span class="badge warn">+${formatDuration(late)} traffic</span>`);
+    // Why slow, and whose word it is: live traffic, hand-reported jams, or other drivers' speeds.
+    if ((r.traffic?.delay ?? 0) >= 60) badges.push(`<span class="badge warn">+${formatDuration(r.traffic.delay)} traffic</span>`);
+    if ((r.delay ?? 0) >= 60) badges.push(`<span class="badge warn">+${formatDuration(r.delay)} slow (reports)</span>`);
+    if ((r.probe_delay ?? 0) >= 60) badges.push(`<span class="badge warn">+${formatDuration(r.probe_delay)} slow (driver speeds)</span>`);
     if (r.warning === 'construction') badges.push('<span class="badge warn">May pass roadworks</span>');
     b.innerHTML = `<span class="r-time">${formatDuration(r.duration)}</span><span class="r-info"><b>${r.via ? `via ${esc(r.via)}` : 'Route'} </b>${formatDistance(r.distance, state.settings.units)} · arrive ${formatClock(new Date(Date.now() + r.duration * 1000))}<br>${badges.join('')}</span>`;
     b.onclick = () => selectRoute(i);
@@ -1707,6 +1710,7 @@ async function arrive() {
 
 async function endDrive(arrived) {
   stopSimulation();
+  discardProbeBuffer(); // fixes buffered on this drive must not leak into a later batch
   parkingFor = null;
   $('parking-label').textContent = 'Parking nearby';
   $('parking').classList.add('hidden');

@@ -6,7 +6,7 @@
 export const $ = (id) => document.getElementById(id);
 
 export const DEFAULT_SETTINGS = {
-  voice: true, alerts: true, speed_warning: true, units: 'metric', theme: 'auto', avoid_tolls: false, avoid_highways: false, avoid_ferries: false,
+  voice: true, alerts: true, speed_warning: true, units: 'metric', theme: 'auto', avoid_tolls: false, avoid_highways: false, avoid_ferries: false, traffic_probe: false,
 };
 
 export const state = {
@@ -41,12 +41,12 @@ export const local = {
 };
 
 // ---------- API ----------
-export let appConfig = null; // server knobs (/api/config): which signup/login checks are on
+export let appConfig = null; // server knob (/api/config): whether two-factor login is on
 export async function loadConfig() {
   try {
     appConfig = await api('/api/config');
   } catch {
-    appConfig = { captcha: {}, emailVerification: {}, twoFactor: {} };
+    appConfig = { twoFactor: {} };
   }
   return appConfig;
 }

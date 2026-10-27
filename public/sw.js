@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Thaqif Syarafuddin bin Roslan. A2B: https://github.com/thaqif0709/a2b (see NOTICE).
 
 // Keeps the app shell available offline and fast to open. API calls and map tiles always go to the network.
-const CACHE = 'a2b-v32';
+const CACHE = 'a2b-v33';
 const SHELL = ['/', '/styles.css', '/app.js', '/core.js', '/panels.js', '/nav.js', '/motion.js', '/voice.js', '/vehicle3d.js', '/geo.js', '/icons.js', '/report-types.js', '/map-themes.js', '/places.js', '/text.js', '/sheet-drag.js', '/follow.js', '/presence.js', '/welcome.js', '/update.js', '/icon.svg', '/manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {

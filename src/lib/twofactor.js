@@ -56,21 +56,26 @@ export async function totpCode(secret, at = Date.now()) {
 }
 
 // Accepts codes from the neighbouring time steps (window=1) so slight clock drift doesn't lock people out.
-export async function verifyTOTP(secret, code, { window = 1, at = Date.now() } = {}) {
+// Returns the matched 30 s step, or null: the caller records it so a code can't be replayed in a later challenge.
+export async function verifyTOTPStep(secret, code, { window = 1, at = Date.now() } = {}) {
   const c = String(code ?? '').replace(/[\s-]/g, '');
-  if (!/^\d{6,8}$/.test(c)) return false;
+  if (!/^\d{6,8}$/.test(c)) return null;
   const short = c.slice(-6);
   const step = Math.floor(at / STEP_MS);
   const bytes = decodeSecret(secret);
-  if (!bytes.length) return false;
+  if (!bytes.length) return null;
   for (let d = -window; d <= window; d++) {
-    if ((await hotp(bytes, BigInt(step + d))) === short) return true;
+    if ((await hotp(bytes, BigInt(step + d))) === short) return step + d;
   }
-  return false;
+  return null;
+}
+
+export async function verifyTOTP(secret, code, opts) {
+  return (await verifyTOTPStep(secret, code, opts)) != null;
 }
 
 export function twoFactorMode(env) {
-  const v = String(env.TWO_FACTOR ?? 'optional').trim().toLowerCase();
+  const v = String(env.TWO_FACTOR ?? 'off').trim().toLowerCase();
   if (['off', 'false', 'disabled', 'no'].includes(v)) return 'off';
   if (['required', 'require', 'enforced', 'mandatory'].includes(v)) return 'required';
   return 'optional';

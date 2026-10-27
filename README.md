@@ -56,12 +56,19 @@ Keep the screen on while you drive (A2B keeps it awake). Only use it when it's s
 ## What's different
 
 - **Routes listen to drivers.** Roads reported closed are avoided, and reported jams add to the ETA of the routes
-  they're on, so you can see why one route is slower.
+  they're on, so you can see why one route is slower. Drivers who share speeds add slow stretches the same way,
+  marked as driver speeds rather than reports.
 - **Reports fade as they age.** Fresh or confirmed reports are solid, old unconfirmed ones turn see-through, and a
   second report of the same thing confirms the first instead of adding another pin.
-- **No ads, and your drives aren't tracked.** The server keeps what you save, your reports, a shared drive's latest
+- **No ads, and your drives aren't tracked by default.** The server keeps what you save, your reports, a shared drive's latest
   position while you're sharing it, and an anonymous device ID to count how many people are on (for the 50-driver
   limit). It doesn't record where you drive.
+- **Optional traffic sharing (off by default).** Switch it on in Settings › Traffic and the app sends a small batch of
+  recent fixes every 30 seconds while you drive: your position rounded to about 100 m on your phone, speed,
+  direction and time. The server folds them straight into anonymous per-street totals (street block, direction,
+  average speed, how many fixes from how many drivers) and never stores your raw trail; totals older than a day
+  are deleted every night. Streets where at least three drivers crawl show as slow for everyone. Turn it off any
+  time to stop sharing.
 - **Open source.** Anyone can read the code, suggest changes, or run their own copy.
 
 ## Run it on your computer
@@ -178,7 +185,7 @@ test/                   node --test: the navigation engine and the whole API on 
 
 | Area | Endpoints |
 | --- | --- |
-| Accounts | `POST /api/auth/signup`, `/login`, `/logout` · `GET /api/auth/verify` · `POST /api/auth/resend` · `POST /api/auth/2fa/setup`, `/enable`, `/disable`, `/verify` · `GET`, `PATCH`, `DELETE /api/me` · `GET /api/config` |
+| Accounts | `POST /api/auth/signup`, `/login`, `/logout` · `POST /api/auth/2fa/setup`, `/enable`, `/disable`, `/verify` · `GET`, `PATCH`, `DELETE /api/me` · `GET /api/config` |
 | Saved places | `GET`, `POST /api/places` · `PATCH`, `DELETE /api/places/:id` · `POST /api/places/import` |
 | Search and routes | `GET /api/search` · `GET /api/reverse` · `POST /api/route` · `GET /api/parking` |
 | Reports | `GET`, `POST /api/reports` · `POST /api/reports/:id/vote` · `GET /api/leaderboard` |
@@ -194,20 +201,14 @@ test/                   node --test: the navigation engine and the whole API on 
 - Secrets (the Cloudflare token, tester emails) live in Cloudflare, never in the code.
 - A daily job clears expired sessions, old shared drives and old usage numbers.
 
-### Protecting signup & login (optional, all admin-controlled)
+### Two-factor logins (optional, off by default)
 
-Three extra checks can be switched on without touching the code — copy `.dev.vars.example` to `.dev.vars`
-for local runs, or set the same names as vars and `npx wrangler secret put <NAME>` for secrets in production:
-
-| What | Knob | How it behaves |
-| --- | --- | --- |
-| CAPTCHA | `CAPTCHA_ENABLED=true` + `TURNSTILE_SITEKEY` (var) and `TURNSTILE_SECRET` (secret) | Cloudflare Turnstile on signup, and on logins once a password looks guessed. Get the keys under Turnstile in the Cloudflare dashboard. |
-| Email verification | `EMAIL_VERIFICATION=optional` or `required` + `EMAIL_FROM` and `RESEND_API_KEY` (secret, from [resend.com](https://resend.com)) | `optional` sends the link but logs the driver straight in; `required` holds the session until the `/verify/<token>` link is opened, and blocks login until then. Without an email provider the link is only logged server-side. |
-| Two-factor logins | `TWO_FACTOR=off` / `optional` / `required` | TOTP authenticator apps (no extra service): drivers switch it on in Settings › Account; `required` enrols existing accounts at their next login. |
-
-Signup is also throttled per network (`SIGNUP_MAX_PER_HOUR`, 20 by default), and the sign-in screen reads
-`GET /api/config` to only show the checks that are on. `EMAIL_DEBUG=1` is test-only: it returns the
-verification token in the response so `npm test` needs no email provider — never enable it in production.
+Drivers can add a TOTP authenticator-app code at login — no extra service needed. Set
+`TWO_FACTOR=off` | `optional` | `required` (in `wrangler.toml`, or `.dev.vars` locally from
+`.dev.vars.example`): `optional` lets drivers switch it on in Settings › Account, `required`
+enrols existing accounts at their next login. A challenge allows a few wrong codes before it
+dies, wrong codes count towards the per-account lockout like wrong passwords, and a used code
+can't be replayed. The sign-in screen reads `GET /api/config` to only show what's on.
 
 </details>
 
