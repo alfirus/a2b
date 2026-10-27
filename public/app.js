@@ -11,11 +11,11 @@ import { searchNearby, mergeResults, attribution as placesAttribution } from './
 import { start as startVehicle, DEFAULT_COLOR } from './vehicle3d.js';
 import { turnIcon, roundaboutIcon, laneIcon, CAR, DEST_PIN, DROP_PIN, PLACE_ICONS, soundIcon } from './icons.js';
 import {
-  $, state, api, local, toast, esc, timeAgo, speak, loadLocalSettings, saveSettings, loadPlaces, addPlace, removePlace,
+  $, state, api, loadConfig, local, toast, esc, timeAgo, speak, loadLocalSettings, saveSettings, loadPlaces, addPlace, removePlace,
   isSaved, setHomeWork, armBack,
 } from './core.js';
 import { MAP_THEMES, BASE_STYLES, applyMapTheme } from './map-themes.js';
-import { initPanels, openMenu, openAuth, openSettings, renderAvatar, refreshMe } from './panels.js';
+import { initPanels, openMenu, openAuth, openSettings, renderAvatar, refreshMe, verifyEmailToken } from './panels.js';
 import { startPresence, checkIn } from './presence.js';
 import { welcome, hideSplash } from './welcome.js';
 import { watchUpdates, updateCheckpoint } from './update.js';
@@ -199,9 +199,16 @@ async function boot() {
   setInterval(() => applyTheme(), 5 * 60_000);
 
   await refreshMe();
+  await loadConfig();
   await onUserChanged();
 
-  // Deep links: /drive/<token> watches a shared drive; /?to=lat,lng&name= opens a destination.
+  // Deep links: /drive/<token> watches a shared drive; /verify/<token> confirms a new email;
+  // /?to=lat,lng&name= opens a destination.
+  const v = location.pathname.match(/^\/verify\/([a-z0-9]+)$/i);
+  if (v) {
+    history.replaceState(null, '', '/');
+    await verifyEmailToken(v[1]);
+  }
   const m = location.pathname.match(/^\/drive\/([a-z0-9]+)$/i);
   if (m) return startWatching(m[1]); // watching a friend's drive doesn't take one of the spots
   startPresence({ driving: () => mode === 'drive', signUp: () => openAuth(null, 'signup') });

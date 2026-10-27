@@ -3,7 +3,7 @@
 
 // "My A2B" menu, sign in / sign up, settings, saved places, leaderboard and about.
 
-import { $, state, api, local, toast, esc, initials, saveSettings, setHomeWork, removePlace, renamePlace, armBack, speak } from './core.js';
+import { $, state, api, appConfig, local, toast, esc, initials, saveSettings, setHomeWork, removePlace, renamePlace, armBack, speak } from './core.js';
 import { pickVoice } from './voice.js';
 import { appVersion } from './update.js';
 import { VEHICLES, COLORS, DEFAULT_COLOR } from './vehicle3d.js';
@@ -13,6 +13,8 @@ let ctx; // callbacks from app.js
 let authMode = 'signup';
 let authReason = null;
 let installPrompt = null;
+let pendingChallenge = null; // second login step: { id, setup, secret, otpauth_url }
+let turnstileWidget = null;
 
 export function initPanels(callbacks) {
   ctx = callbacks;
@@ -25,6 +27,15 @@ export function initPanels(callbacks) {
   $('m-install').onclick = install;
   $('auth-switch').onclick = () => setAuthMode(authMode === 'signup' ? 'login' : 'signup');
   $('auth-form').onsubmit = submitAuth;
+  $('auth-resend').onclick = async () => {
+    const email = new FormData($('auth-form')).get('email');
+    try {
+      await api('/api/auth/resend', { method: 'POST', body: { email } });
+      toast('Email sent — if that address still needs verifying, the link is on its way.');
+    } catch (e) {
+      toast(e.message);
+    }
+  };
   window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
     installPrompt = e;
@@ -102,31 +113,114 @@ export function openAuth(reason = null, mode = 'signup') {
 
 function setAuthMode(mode) {
   authMode = mode;
+  pendingChallenge = null;
   const signup = mode === 'signup';
   $('auth-title').textContent = signup ? 'Sign up' : 'Log in';
   $('auth-submit').textContent = signup ? 'Create account' : 'Log in';
   $('auth-switch').textContent = signup ? 'Already have an account? Log in' : 'New here? Create an account';
   document.querySelector('#auth-form .name-row').classList.toggle('hidden', !signup);
   document.querySelector('#auth-form [name=password]').autocomplete = signup ? 'new-password' : 'current-password';
+  $('auth-2fa-row').classList.add('hidden');
+  $('auth-verify-note').classList.add('hidden');
+  $('auth-resend').classList.add('hidden');
   $('auth-error').classList.add('hidden');
+  renderCaptcha();
+}
+
+// Cloudflare Turnstile, only when the server switched it on (see /api/config).
+function renderCaptcha() {
+  const box = $('captcha-box');
+  box.innerHTML = '';
+  box.classList.add('hidden');
+  turnstileWidget = null;
+  const cfg = appConfig?.captcha;
+  if (!cfg?.enabled || !cfg?.siteKey) return;
+  box.classList.remove('hidden');
+  const render = () => {
+    try {
+      if (window.turnstile && box.isConnected) turnstileWidget = window.turnstile.render(box, { sitekey: cfg.siteKey });
+    } catch {}
+  };
+  if (window.turnstile) render();
+  else if (!document.querySelector('script[data-turnstile]')) {
+    const s = document.createElement('script');
+    s.dataset.turnstile = '1';
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+    s.defer = true;
+    s.onload = render;
+    document.head.appendChild(s);
+  }
+}
+
+function captchaToken() {
+  try {
+    return window.turnstile && turnstileWidget !== null ? window.turnstile.getResponse(turnstileWidget) : '';
+  } catch {
+    return '';
+  }
+}
+
+function resetCaptcha() {
+  try {
+    if (window.turnstile && turnstileWidget !== null) window.turnstile.reset(turnstileWidget);
+  } catch {}
 }
 
 async function submitAuth(e) {
   e.preventDefault();
   const f = new FormData($('auth-form'));
-  const body = { email: f.get('email'), password: f.get('password') };
-  if (authMode === 'signup') Object.assign(body, { name: f.get('name'), settings: state.settings });
   const btn = $('auth-submit');
-  const label = btn.textContent;
+  const label = pendingChallenge ? 'Verify code' : btn.textContent;
   const fields = $('auth-form').querySelectorAll('input, button');
   // Show progress in the button (and lock the form) so a slow network doesn't look like a frozen screen.
   const busy = (text) => (btn.innerHTML = `<span class="spinner" aria-hidden="true"></span>${esc(text)}`);
   fields.forEach((x) => (x.disabled = true));
   btn.classList.add('busy');
-  busy(authMode === 'signup' ? 'Creating account…' : 'Logging in…');
+  busy(authMode === 'signup' && !pendingChallenge ? 'Creating account…' : pendingChallenge ? 'Checking code…' : 'Logging in…');
   $('auth-error').classList.add('hidden');
   try {
-    await api(`/api/auth/${authMode}`, { method: 'POST', body });
+    // Second login step: the password already passed, now the authenticator code.
+    if (pendingChallenge) {
+      await api('/api/auth/2fa/verify', { method: 'POST', body: { challenge_id: pendingChallenge.id, code: String(f.get('totp') ?? '').trim() } });
+      pendingChallenge = null;
+      await finishAuth('Welcome back');
+      return;
+    }
+    const body = { email: f.get('email'), password: f.get('password') };
+    if (authMode === 'signup') Object.assign(body, { name: f.get('name'), settings: state.settings });
+    const captcha = captchaToken();
+    if (captcha) body.captcha = captcha;
+    const data = await api(`/api/auth/${authMode}`, { method: 'POST', body });
+    if (data.verificationRequired) {
+      // The account exists, but the inbox check comes first.
+      setAuthMode('login');
+      $('auth-verify-note').textContent = 'Check your email for the verification link (it lasts a day), then log in below.';
+      $('auth-verify-note').classList.remove('hidden');
+      $('auth-resend').classList.remove('hidden');
+      toast('Check your email to verify the account');
+      return;
+    }
+    if (data.two_factor_required || data.two_factor_setup_required) {
+      pendingChallenge = { id: data.challenge_id, setup: Boolean(data.two_factor_setup_required) };
+      $('auth-2fa-row').classList.remove('hidden');
+      document.querySelector('#auth-form .name-row').classList.add('hidden');
+      btn.textContent = 'Verify code';
+      $('auth-switch').textContent = 'Back to log in';
+      const note = $('auth-verify-note');
+      if (data.two_factor_setup_required) {
+        note.innerHTML = `Two-factor is now required: add this secret to your authenticator app, then enter the code.<br><b>${esc(data.secret)}</b>`;
+      } else {
+        note.textContent = 'Enter the 6-digit code from your authenticator app.';
+      }
+      note.classList.remove('hidden');
+      // The auth-switch button doubles as "start over" while a challenge is pending.
+      $('auth-switch').onclick = () => {
+        pendingChallenge = null;
+        $('auth-switch').onclick = () => setAuthMode(authMode === 'signup' ? 'login' : 'signup');
+        setAuthMode('login');
+      };
+      return;
+    }
     await refreshMe();
     if (authMode === 'signup') {
       busy('Copying your places…');
@@ -140,13 +234,42 @@ async function submitAuth(e) {
     toast(authMode === 'signup' ? `Welcome, ${state.user.name}!` : `Welcome back, ${state.user.name}!`);
     if (authReason === 'report') $('btn-report').click();
   } catch (err) {
+    if (err.code === 'email_not_verified') {
+      $('auth-verify-note').textContent = 'That email is not verified yet. Open the link in your inbox, or send it again below.';
+      $('auth-verify-note').classList.remove('hidden');
+      $('auth-resend').classList.remove('hidden');
+    }
     $('auth-error').textContent = err.message;
     $('auth-error').classList.remove('hidden');
   } finally {
+    resetCaptcha();
     fields.forEach((x) => (x.disabled = false));
     btn.classList.remove('busy');
-    btn.textContent = label;
+    btn.textContent = pendingChallenge ? 'Verify code' : label;
   }
+}
+
+// The /verify/<token> link from the email lands here (see public/app.js).
+export async function verifyEmailToken(token) {
+  try {
+    await api(`/api/auth/verify?token=${encodeURIComponent(token)}`, { method: 'GET' });
+    await refreshMe();
+    await ctx.onUserChanged();
+    toast(`Email verified — welcome, ${state.user.name}!`);
+  } catch (err) {
+    toast(err.message);
+    openAuth(null, 'login');
+  }
+}
+
+async function finishAuth(greeting) {
+  await refreshMe();
+  $('auth').classList.add('hidden');
+  $('auth-form').reset();
+  await ctx.onUserChanged();
+  ctx.applyTheme();
+  ctx.refreshSound();
+  toast(`${greeting}, ${state.user.name}!`);
 }
 
 // A brand-new account takes over everything the guest kept on this device: Home, Work, saved places and recent
@@ -233,6 +356,8 @@ export function openSettings() {
     </div>
     ${u ? `<div class="set-group"><h3>Account</h3>
       <button class="set-row" id="s-name"><span>Display name<small>${esc(u.name)}</small></span></button>
+      ${appConfig?.emailVerification?.mode && appConfig.emailVerification.mode !== 'off' && !u.email_verified ? `<button class="set-row" id="s-verify"><span>Verify email<small>${esc(u.email)} — open the link from your inbox</small></span></button>` : ''}
+      ${appConfig?.twoFactor?.mode && appConfig.twoFactor.mode !== 'off' ? `<button class="set-row" id="s-2fa"><span>Two-factor authentication<small>${u.totp_enabled ? 'On: a code is asked at login' : 'Off: add an extra code at login'}</small></span></button>` : ''}
       <button class="set-row" id="s-pass"><span>Change password</span></button>
       <button class="set-row" id="s-delete" style="color:var(--danger)"><span>Delete account</span></button>
     </div>` : ''}
@@ -306,6 +431,40 @@ export function openSettings() {
       if (!name?.trim()) return;
       try {
         state.user = (await api('/api/me', { method: 'PATCH', body: { name } })).user;
+        renderAvatar();
+        openSettings();
+      } catch (e) {
+        toast(e.message);
+      }
+    };
+    if ($('s-verify')) $('s-verify').onclick = async () => {
+      try {
+        await api('/api/auth/resend', { method: 'POST', body: { email: u.email } });
+        toast('Email sent — open the link in your inbox.');
+      } catch (e) {
+        toast(e.message);
+      }
+    };
+    if ($('s-2fa')) $('s-2fa').onclick = async () => {
+      try {
+        if (!state.user.totp_enabled) {
+          const { secret, otpauth_url } = await api('/api/auth/2fa/setup', { method: 'POST', body: {} });
+          const code = prompt(`Add this secret to your authenticator app, then enter the 6-digit code:\n\n${secret}\n\n(or add the account from this link: ${otpauth_url})`);
+          if (!code) return;
+          state.user = (await api('/api/auth/2fa/enable', { method: 'POST', body: { code: code.trim() } })).user;
+          toast('Two-factor is on');
+        } else {
+          const code = prompt('Enter a current 6-digit code (or leave it blank to use your password instead)');
+          let done;
+          if (code?.trim()) done = await api('/api/auth/2fa/disable', { method: 'POST', body: { code: code.trim() } });
+          else {
+            const current = prompt('Current password');
+            if (!current) return;
+            done = await api('/api/auth/2fa/disable', { method: 'POST', body: { current_password: current } });
+          }
+          state.user = done.user;
+          toast('Two-factor is off');
+        }
         renderAvatar();
         openSettings();
       } catch (e) {

@@ -178,7 +178,7 @@ test/                   node --test: the navigation engine and the whole API on 
 
 | Area | Endpoints |
 | --- | --- |
-| Accounts | `POST /api/auth/signup`, `/login`, `/logout` · `GET`, `PATCH`, `DELETE /api/me` |
+| Accounts | `POST /api/auth/signup`, `/login`, `/logout` · `GET /api/auth/verify` · `POST /api/auth/resend` · `POST /api/auth/2fa/setup`, `/enable`, `/disable`, `/verify` · `GET`, `PATCH`, `DELETE /api/me` · `GET /api/config` |
 | Saved places | `GET`, `POST /api/places` · `PATCH`, `DELETE /api/places/:id` · `POST /api/places/import` |
 | Search and routes | `GET /api/search` · `GET /api/reverse` · `POST /api/route` · `GET /api/parking` |
 | Reports | `GET`, `POST /api/reports` · `POST /api/reports/:id/vote` · `GET /api/leaderboard` |
@@ -193,6 +193,21 @@ test/                   node --test: the navigation engine and the whole API on 
   `public/_headers`.
 - Secrets (the Cloudflare token, tester emails) live in Cloudflare, never in the code.
 - A daily job clears expired sessions, old shared drives and old usage numbers.
+
+### Protecting signup & login (optional, all admin-controlled)
+
+Three extra checks can be switched on without touching the code — copy `.dev.vars.example` to `.dev.vars`
+for local runs, or set the same names as vars and `npx wrangler secret put <NAME>` for secrets in production:
+
+| What | Knob | How it behaves |
+| --- | --- | --- |
+| CAPTCHA | `CAPTCHA_ENABLED=true` + `TURNSTILE_SITEKEY` (var) and `TURNSTILE_SECRET` (secret) | Cloudflare Turnstile on signup, and on logins once a password looks guessed. Get the keys under Turnstile in the Cloudflare dashboard. |
+| Email verification | `EMAIL_VERIFICATION=optional` or `required` + `EMAIL_FROM` and `RESEND_API_KEY` (secret, from [resend.com](https://resend.com)) | `optional` sends the link but logs the driver straight in; `required` holds the session until the `/verify/<token>` link is opened, and blocks login until then. Without an email provider the link is only logged server-side. |
+| Two-factor logins | `TWO_FACTOR=off` / `optional` / `required` | TOTP authenticator apps (no extra service): drivers switch it on in Settings › Account; `required` enrols existing accounts at their next login. |
+
+Signup is also throttled per network (`SIGNUP_MAX_PER_HOUR`, 20 by default), and the sign-in screen reads
+`GET /api/config` to only show the checks that are on. `EMAIL_DEBUG=1` is test-only: it returns the
+verification token in the response so `npm test` needs no email provider — never enable it in production.
 
 </details>
 
