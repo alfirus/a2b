@@ -4,6 +4,10 @@
 // What drivers can report. Shared by the app (menus, map pins) and the Worker (validation, lifetimes).
 // `life` is how long a report stays on the map (minutes) unless other drivers confirm or dismiss it.
 
+// Reports are about roads, and placed where you are. Not on a train trip, its walks included: from a train the report
+// would sit on the rail line, and drivers on roads nearby would be warned of jams, police or hazards that aren't there.
+export const canReportFrom = (mode) => mode !== 'ride';
+
 export const REPORT_TYPES = {
   traffic: {
     label: 'Traffic', color: '#e5484d', life: 30, points: 5,

@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS presence (device TEXT PRIMARY KEY, user_id INTEGER, a
 CREATE INDEX IF NOT EXISTS presence_seen ON presence (last_seen);
 CREATE TABLE IF NOT EXISTS usage_daily (day TEXT PRIMARY KEY, peak_active INTEGER NOT NULL DEFAULT 0, peak_at INTEGER, signups INTEGER NOT NULL DEFAULT 0, routes INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, tomtom INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS usage_devices (day TEXT NOT NULL, device TEXT NOT NULL, account INTEGER NOT NULL DEFAULT 0, turned_away INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, device));
-CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, user_id INTEGER, device TEXT, message TEXT NOT NULL, app TEXT, ua TEXT, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, user_id INTEGER, device TEXT, message TEXT NOT NULL, app TEXT, ua TEXT, created_at INTEGER NOT NULL, closed_at INTEGER);
 CREATE INDEX IF NOT EXISTS feedback_device ON feedback (device, created_at);
 CREATE TABLE IF NOT EXISTS probe_segments (
   segment TEXT PRIMARY KEY, lat REAL NOT NULL, lng REAL NOT NULL, dir INTEGER NOT NULL,
@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS probe_devices (
 );
 CREATE INDEX IF NOT EXISTS probe_devices_live ON probe_devices (updated_at);
 CREATE TABLE IF NOT EXISTS probe_limits (device_hash TEXT PRIMARY KEY, last_at INTEGER NOT NULL, day TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS recovery_codes (user_id INTEGER PRIMARY KEY, code_hash TEXT NOT NULL, created_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0)
+CREATE TABLE IF NOT EXISTS recovery_codes (user_id INTEGER PRIMARY KEY, code_hash TEXT NOT NULL, created_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS chargers (id TEXT PRIMARY KEY, source TEXT NOT NULL, name TEXT NOT NULL, lat REAL NOT NULL, lng REAL NOT NULL, details TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS chargers_source ON chargers (source, updated_at)
 `;
 
 let ready = null;

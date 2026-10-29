@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Thaqif Syarafuddin bin Roslan. A2B: https://github.com/thaqif0709/a2b (see NOTICE).
 
-// The car on the map as a real 3D model (a chevron or a small car), drawn into the map with three.js through a
+// The car on the map as a real 3D model (a chevron or a small car; a train on the train part of a trip), drawn into the map with three.js through a
 // MapLibre custom layer, so it sits on the road in the map's own perspective. three.js is loaded on first use;
 // if it can't load or WebGL refuses, start() resolves false and the app keeps its flat arrow.
 
 const THREE_URL = 'https://unpkg.com/three@0.160.0/build/three.module.js';
-const SIZE_PX = { chevron: 44, car: 48 }; // on-screen length, whatever the zoom
+const SIZE_PX = { chevron: 44, car: 48, train: 78 }; // on-screen length, whatever the zoom
 export const VEHICLES = [['chevron', 'Chevron'], ['car', 'Car']];
 // Paint colours to choose from in Settings; the first, a brighter take on the app's plum, is the default.
 export const COLORS = [
@@ -18,7 +18,8 @@ export const DEFAULT_COLOR = COLORS[0][0];
 let THREE = null;
 let loading = null;
 
-// pose(): { pos: [lng, lat], heading } of the car as drawn this frame, or null to hide it.
+// pose(): { pos: [lng, lat], heading } of the car as drawn this frame, or null to hide it. `kind` is a VEHICLES
+// value, or 'train' (in the line's colour) while riding.
 export async function start(map, kind, color, pose) {
   try {
     THREE ??= await (loading ??= import(THREE_URL));
@@ -31,7 +32,7 @@ export async function start(map, kind, color, pose) {
   scene.add(new THREE.HemisphereLight('#ffffff', '#6b5a64', 1.6));
   const sun = new THREE.DirectionalLight('#ffffff', 2.2);
   sun.position.set(-0.6, 1.2, -0.4);
-  scene.add(sun, kind === 'car' ? car(color) : chevron(color), contactShadow(kind));
+  scene.add(sun, kind === 'car' ? car(color) : kind === 'train' ? train(color) : chevron(color), contactShadow(kind));
   const camera = new THREE.Camera();
   const rotateUp = new THREE.Matrix4().makeRotationX(Math.PI / 2);
   let renderer = null;
@@ -157,6 +158,41 @@ function car(color) {
   return g;
 }
 
+// A short LRT/MRT unit in the line's colour: a long body with a rounded nose at each end, a dark window band all
+// round, a pale roof, and a lit front (white) and back (red), so which way it's going reads at a glance.
+function train(color) {
+  // Two carriages end to end, long and narrow so it reads as a train and not a car even from above: each in the
+  // line's colour with a dark window band, a pale roof and a dark gap between them; a lit front and a red back.
+  const g = new THREE.Group();
+  const paint = material(color, { roughness: 0.3, metalness: 0.25 });
+  const glass = material('#14202b', { roughness: 0.08, metalness: 0.6 });
+  const roofPaint = material('#eef1f4', { roughness: 0.5 });
+  const W = 0.26, L = 0.58, GAP = 0.05;
+  for (const z of [-(L + GAP) / 2, (L + GAP) / 2]) {
+    const body = new THREE.Mesh(slab(roundedRect(W, L, 0.1), 0.16, 0.03), paint);
+    body.position.set(0, 0.04, z);
+    const band = new THREE.Mesh(slab(roundedRect(W + 0.01, L - 0.04, 0.09), 0.07, 0.015), glass);
+    band.position.set(0, 0.19, z);
+    const roof = new THREE.Mesh(slab(roundedRect(W - 0.04, L - 0.08, 0.08), 0.04, 0.015), roofPaint);
+    roof.position.set(0, 0.27, z);
+    g.add(body, band, roof);
+  }
+  const join = new THREE.Mesh(new THREE.BoxGeometry(W - 0.08, 0.14, GAP + 0.02), material('#1b1b20', { roughness: 0.8 }));
+  join.position.set(0, 0.12, 0);
+  g.add(join);
+  const end = L + GAP / 2;
+  const lamp = (c, glow, z) => {
+    for (const x of [-0.07, 0.07]) {
+      const l = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.035, 0.02), material(c, { emissive: glow, emissiveIntensity: 0.8 }));
+      l.position.set(x, 0.12, z);
+      g.add(l);
+    }
+  };
+  lamp('#fff6c8', '#fff1a8', -end - 0.005); // the front
+  lamp('#ff3b47', '#c4121d', end + 0.005); // the back
+  return g;
+}
+
 // A soft dark patch under the model, so it looks grounded.
 function contactShadow(kind) {
   const c = document.createElement('canvas');
@@ -167,7 +203,7 @@ function contactShadow(kind) {
   r.addColorStop(1, 'rgba(0,0,0,0)');
   g.fillStyle = r;
   g.fillRect(0, 0, 128, 128);
-  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.25, kind === 'car' ? 1.5 : 1.25), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }));
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(kind === 'train' ? 0.6 : 1.25, kind === 'train' ? 1.55 : kind === 'car' ? 1.5 : 1.25), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }));
   m.rotation.x = -Math.PI / 2;
   m.position.y = 0.005;
   return m;

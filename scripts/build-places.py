@@ -7,7 +7,9 @@ Downloads Overture's places for one country, keeps the reasonably confident ones
 writes them as small JSON files into public/places/: one file per area of 0.5 x 0.5 degrees (about
 55 x 55 km) and first letter of a word in the place's name. Searching "nandos" near you downloads only
 the "n" file for your area and the areas next to it, and searches it on the phone, so this costs nothing
-to host and uses no database.
+to host and uses no database. Each area also gets a file per kind of place people look for nearby (petrol
+stations, hospitals, clinics, police stations, convenience stores, EV chargers; see TYPES), for searches like "petrol"
+that name a kind of place rather than a place: most petrol stations are just called "Petronas" or "Shell".
 
 OpenStreetMap-sourced places are left out: A2B already searches OpenStreetMap through Photon, and leaving
 them out keeps these files free of ODbL share-alike terms.
@@ -33,6 +35,28 @@ DEFAULT_RELEASE = '2026-10-21.0'
 AREA = 0.5  # degrees; public/places.js reads it from index.json
 SPLIT_OVER = 3000  # a file with more places than this is split by the next letter ("s" -> "sa", "sh", "st"…)
 MAX_PREFIX = 3
+
+# Kinds of place searched for by type (public/places.js TYPE_WORDS): Overture categories, and for categories that
+# mix kinds (its "hospital" covers every klinik too), what the name must or mustn't say. Files are named "@<type>".
+HOSPITAL_NAME = re.compile(r'\b(hospital|hospitals|hosp|medical cent(re|er)|medical specialist|specialist (cent(re|er)|hospital)|pusat perubatan)\b', re.I)
+CLINIC_NAME = re.compile(r'\b(klinik|clinic|poliklinik|polyclinic|kesihatan|medical clinic|dr|doctor)\b', re.I)
+DENTAL_NAME = re.compile(r'\b(dental|dentist|pergigian|gigi|orthodontic)\b', re.I)
+CLINIC_CATEGORIES = {
+    'primary_care_or_general_clinic', 'walk_in_clinic', 'urgent_care_clinic', 'outpatient_care_facility',
+    'pediatric_clinic', 'emergency_or_urgent_care_facility',
+}
+TYPES = {
+    'fuel': lambda name, cat: cat in ('gas_station', 'fueling_station'),
+    'hospital': lambda name, cat: cat in ('specialty_hospital', 'emergency_department')
+        or (cat in ('hospital', 'specialized_medical_facility', 'medical_service', 'health_care')
+            and bool(HOSPITAL_NAME.search(name)) and not CLINIC_NAME.search(name)),
+    'clinic': lambda name, cat: not DENTAL_NAME.search(name) and (
+        cat in CLINIC_CATEGORIES
+        or (cat in ('hospital', 'health_care', 'medical_service') and bool(CLINIC_NAME.search(name)))),
+    'police': lambda name, cat: cat == 'police_station',
+    'convenience': lambda name, cat: cat == 'convenience_store',
+    'ev': lambda name, cat: cat == 'ev_charging_station',  # the server adds OpenStreetMap's and Open Charge Map's
+}
 
 # Rough bounding boxes, so Overture only has to scan the right parts of its files.
 COUNTRY_BOXES = {
@@ -87,6 +111,7 @@ def main():
     print(f'  {len(rows):,} places in {time.time() - t0:.0f}s', flush=True)
 
     shards = {}  # 'area/prefix' -> [(place, words)]
+    typed = {}  # 'area/@kind' -> [(place, words)]
     for name, lng, lat, street, locality, category, _conf in rows:
         area = f'{math.floor(lat / AREA)}_{math.floor(lng / AREA)}'
         address = ', '.join(dict.fromkeys(p.strip() for p in (street, locality) if p and p.strip()))[:70]
@@ -94,7 +119,11 @@ def main():
         name_words = words(name)
         for letter in sorted({shard_letter(w) for w in name_words}):
             shards.setdefault(f'{area}/{letter}', []).append((place, name_words))
+        for kind, test in TYPES.items():
+            if test(name, category or ''):
+                typed.setdefault(f'{area}/@{kind}', []).append((place, name_words))
     shards = split_big(shards)
+    shards.update(typed)  # never split: one file per kind and area
 
     out = os.path.abspath(args.out)
     if os.path.isdir(out):

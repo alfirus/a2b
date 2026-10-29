@@ -4,11 +4,13 @@
 // "My A2B" menu, sign in / sign up, settings, saved places, leaderboard and about.
 
 import { $, state, api, appConfig, loadConfig, local, toast, esc, initials, saveSettings, setHomeWork, removePlace, renamePlace, armBack, speak } from './core.js';
+import { PLACE_ICONS } from './icons.js';
 import { stopSharing } from './probe.js';
 import { pickVoice } from './voice.js';
 import { appVersion } from './update.js';
 import { VEHICLES, COLORS, DEFAULT_COLOR } from './vehicle3d.js';
 import { onlineLine } from './presence.js';
+import { tileCount, clearOfflineTiles, originUsage } from './offline.js';
 
 let ctx; // callbacks from app.js
 let authMode = 'signup';
@@ -299,6 +301,16 @@ function openPanel(title, html) {
 }
 
 // The voice directions are read in (see voice.js), with a sample to hear it.
+async function renderOfflineSize() {
+  const el = $('s-offline-size');
+  if (!el) return;
+  const [count, usage] = await Promise.all([tileCount(), originUsage()]);
+  const fresh = $('s-offline-size');
+  if (!fresh) return; // settings closed while counting
+  const mb = usage?.usage ? ` · ${(usage.usage / 1048576).toFixed(0)} MB used by the app` : '';
+  fresh.textContent = count ? `${count.toLocaleString()} map tiles${mb}` : `Nothing saved yet${mb}`;
+}
+
 function renderVoiceList() {
   const box = $('voice-list');
   const v = pickVoice();
@@ -356,6 +368,7 @@ export async function openSettings() {
       ${toggleRow('avoid_tolls', 'Avoid toll roads')}
       ${toggleRow('avoid_highways', 'Avoid highways')}
       ${toggleRow('avoid_ferries', 'Avoid ferries')}
+      ${toggleRow('map_pois', 'Petrol, hospitals, clinics and shops on the map', 'Shown when zoomed in. Tap one, or a station or landmark, for routes there.')}
       <p class="hint" style="padding:4px 18px">Roads that other drivers report as closed are avoided automatically.</p>
     </div>
     <div class="set-group"><h3>Traffic</h3>
@@ -370,6 +383,10 @@ export async function openSettings() {
       <div class="set-row swatch-row"><span>Colour</span><div class="swatches" id="s-vehicle-color">${COLORS
         .map(([c, l]) => `<button data-c="${c}" aria-label="${l}" title="${l}" class="${local.get('vehicleColor', DEFAULT_COLOR) === c ? 'on' : ''}" style="--c:${c}"></button>`)
         .join('')}</div></div>
+    </div>
+    <div class="set-group"><h3>Offline maps</h3>
+      <label class="set-row"><span>Save maps for drives<small>Keep the map along your route on this phone, for tunnels and dead spots</small></span><input type="checkbox" class="switch" id="s-offline" ${local.get('offlineMaps', true) ? 'checked' : ''}></label>
+      <div class="set-row"><span>Saved on this phone<small id="s-offline-size">…</small></span><div class="choice"><button id="s-offline-clear">Clear</button></div></div>
     </div>
     <div class="set-group"><h3>Places</h3>
       <button class="set-row" id="s-home"><span>Home<small>${esc(state.home?.address || state.home?.name || 'Not set')}</small></span></button>
@@ -404,6 +421,7 @@ export async function openSettings() {
       if (c.dataset.set === 'traffic_probe' && !c.checked) stopSharing();
       await saveSettings({ [c.dataset.set]: c.checked });
       if (c.dataset.set === 'voice') ctx.refreshSound();
+      if (c.dataset.set === 'map_pois') ctx.drawPois();
     };
   });
   body.querySelectorAll('[data-choice]').forEach((group) => {
@@ -415,6 +433,14 @@ export async function openSettings() {
       if (group.dataset.choice === 'theme') ctx.applyTheme();
     };
   });
+  // Saved maps live on this device only (like the vehicle), so they bypass the synced settings.
+  $('s-offline').onchange = (e) => local.set('offlineMaps', e.target.checked);
+  $('s-offline-clear').onclick = async () => {
+    await clearOfflineTiles();
+    toast('Saved maps cleared.');
+    renderOfflineSize();
+  };
+  renderOfflineSize();
   renderVoiceList();
   if ('speechSynthesis' in window) speechSynthesis.onvoiceschanged = () => $('voice-list') && renderVoiceList();
   // Kept on this device: it's about how this screen looks.
@@ -545,7 +571,7 @@ function openSavedPlaces() {
     ${list.length ? '' : '<p class="hint" style="padding:8px 18px">Tap the star on any destination, or long-press the map, to save it here.</p>'}
     <ul class="place-list">${list
       .map((p) => `<li data-id="${esc(p.id)}"><button class="place-row" data-go><span class="p-ic">⭐</span><span class="p-text"><b>${esc(p.name)}</b><small>${esc(p.address || '')}</small></span></button>
-        <button class="icon-btn" data-rename aria-label="Rename">✎</button><button class="icon-btn" data-del aria-label="Delete">✕</button></li>`)
+        <button class="icon-btn" data-rename aria-label="Rename ${esc(p.name)}">${PLACE_ICONS.edit}</button><button class="icon-btn danger" data-del aria-label="Delete ${esc(p.name)}">${PLACE_ICONS.trash}</button></li>`)
       .join('')}</ul>`);
   $('sp-add').onclick = () => {
     $('panel').classList.add('hidden');
@@ -611,32 +637,45 @@ function openFeedback() {
   setTimeout(() => text.focus(), 300);
 }
 
-// The owner's feedback inbox (GET /api/feedback is only answered for tester accounts). Done removes one.
+// The owner's feedback inbox (GET /api/feedback is only answered for tester accounts). Close marks one handled and
+// moves it under Closed, tagged with when; Reopen brings it back. Nothing is deleted.
 async function openInbox() {
   const body = openPanel('Feedback', '<p class="hint" style="padding:12px 18px">Loading…</p>');
+  let feedback;
   try {
-    const { feedback } = await api('/api/feedback');
-    const device = (ua = '') => (/iphone|ipad/i.test(ua) ? 'iPhone' : /android/i.test(ua) ? 'Android' : /mac/i.test(ua) ? 'Mac' : /windows/i.test(ua) ? 'Windows' : 'Other');
-    const when = (ms) => new Date(ms).toLocaleString([], { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
-    body.innerHTML = feedback.length
-      ? feedback
-        .map((f) => `<div class="fb-item" data-id="${f.id}">
-          <p>${esc(f.message)}</p>
-          <small>${f.email ? `${esc(f.name)} · <a href="mailto:${esc(f.email)}?subject=${encodeURIComponent('Your A2B feedback')}">${esc(f.email)}</a>` : 'Guest'} · ${esc(when(f.created_at))} · ${esc(device(f.ua ?? ''))}${f.app ? ` · ${esc(f.app)}` : ''}</small>
-          <button class="btn ghost" data-done>Done</button>
-        </div>`)
-        .join('')
-      : '<p class="hint" style="padding:12px 18px">No feedback yet.</p>';
-    body.onclick = async (e) => {
-      const item = e.target.closest('[data-done]')?.closest('.fb-item');
-      if (!item) return;
-      try {
-        await api(`/api/feedback/${item.dataset.id}`, { method: 'DELETE' });
-        item.remove();
-        if (!body.querySelector('.fb-item')) body.innerHTML = '<p class="hint" style="padding:12px 18px">All done.</p>';
-      } catch (err) { toast(err.message); }
-    };
-  } catch (e) { body.innerHTML = `<p class="hint" style="padding:12px 18px">${esc(e.message)}</p>`; }
+    ({ feedback } = await api('/api/feedback'));
+  } catch (e) {
+    body.innerHTML = `<p class="hint" style="padding:12px 18px">${esc(e.message)}</p>`;
+    return;
+  }
+  const device = (ua = '') => (/iphone|ipad/i.test(ua) ? 'iPhone' : /android/i.test(ua) ? 'Android' : /mac/i.test(ua) ? 'Mac' : /windows/i.test(ua) ? 'Windows' : 'Other');
+  const when = (ms) => new Date(ms).toLocaleString([], { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+  const item = (f) => `<div class="fb-item${f.closed_at ? ' closed' : ''}" data-id="${f.id}">
+    <p>${esc(f.message)}</p>
+    <small>${f.email ? `${esc(f.name)} · <a href="mailto:${esc(f.email)}?subject=${encodeURIComponent('Your A2B feedback')}">${esc(f.email)}</a>` : 'Guest'} · ${esc(when(f.created_at))} · ${esc(device(f.ua ?? ''))}${f.app ? ` · ${esc(f.app)}` : ''}</small>
+    <div class="fb-actions">${f.closed_at ? `<span class="fb-tag">Closed · ${esc(when(f.closed_at))}</span><button class="btn ghost" data-reopen>Reopen</button>` : '<button class="btn ghost" data-close>Close</button>'}</div>
+  </div>`;
+  const render = () => {
+    const open = feedback.filter((f) => !f.closed_at), closed = feedback.filter((f) => f.closed_at);
+    body.innerHTML = `${open.length ? open.map(item).join('') : `<p class="hint" style="padding:12px 18px">${closed.length ? 'All handled. 🎉' : 'No feedback yet.'}</p>`}
+      ${closed.length ? `<h3 class="list-head fb-head">Closed (${closed.length})</h3>${closed.map(item).join('')}` : ''}`;
+  };
+  render();
+  body.onclick = async (e) => {
+    const btn = e.target.closest('[data-close], [data-reopen]');
+    if (!btn) return;
+    const f = feedback.find((x) => String(x.id) === btn.closest('.fb-item').dataset.id);
+    const closed = btn.hasAttribute('data-close');
+    btn.disabled = true;
+    try {
+      await api(`/api/feedback/${f.id}`, { method: 'PATCH', body: { closed } });
+      f.closed_at = closed ? Date.now() : null;
+      render();
+    } catch (err) {
+      btn.disabled = false;
+      toast(err.message);
+    }
+  };
 }
 
 // The owner's usage dashboard (GET /api/stats is only answered for tester accounts). Refreshes while open.
@@ -698,8 +737,10 @@ function openAbout() {
     <p>Keep your eyes on the road. Only use the app when it is safe and legal to do so. Reports from other drivers can be wrong.</p>
     <p>Map data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>.
        Map tiles by <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a>.
-       Routing by <a href="https://valhalla.github.io/valhalla/" target="_blank" rel="noopener">Valhalla</a>, search by <a href="https://photon.komoot.io" target="_blank" rel="noopener">Photon</a>, live traffic by <a href="https://www.tomtom.com" target="_blank" rel="noopener">TomTom</a>.
-       Shops and places also from <a href="https://overturemaps.org" target="_blank" rel="noopener">Overture Maps Foundation</a> (Meta, Microsoft, Foursquare, AllThePlaces and others; <a href="/places/NOTICE.txt" target="_blank">licences</a>).</p>
+       Routing by <a href="https://valhalla.github.io/valhalla/" target="_blank" rel="noopener">Valhalla</a>, search by <a href="https://photon.komoot.io" target="_blank" rel="noopener">Photon</a>, live traffic by <a href="https://www.tomtom.com" target="_blank" rel="noopener">TomTom</a>,
+       train timetables from Prasarana and KTMB via <a href="https://data.gov.my" target="_blank" rel="noopener">data.gov.my</a>.
+       Shops and places also from <a href="https://overturemaps.org" target="_blank" rel="noopener">Overture Maps Foundation</a> (Meta, Microsoft, Foursquare, AllThePlaces and others; <a href="/places/NOTICE.txt" target="_blank">licences</a>).
+       EV chargers also from <a href="https://openchargemap.org" target="_blank" rel="noopener">Open Charge Map</a> (<a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener">CC BY-SA 4.0</a>).</p>
     <p>A2B is free and open source. <a href="https://github.com/thaqif0709/a2b" target="_blank" rel="noopener">Source code</a>, ideas and bug reports welcome, or send feedback from Settings.</p>
     <p class="about-credit">© 2026 Thaqif Syarafuddin bin Roslan and the A2B contributors.
        <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">GNU AGPL v3</a> with

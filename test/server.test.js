@@ -25,6 +25,8 @@ let failWithExcludes = false;
 let lastLocateBody = null;
 const DETOUR = LINE.map(([lng, lat]) => [lng + 0.003, lat]); // a parallel street ~200 m east
 let osmLookups = 0;
+let signedTrip = null; // a route with a signed exit, for the exit-sign test
+let overpassCalls = 0;
 let tomtomDown = false;
 let cameras = null; // the built speed camera list, as in public/cameras.json
 let tomtomCalls = 0;
@@ -71,10 +73,12 @@ globalThis.fetch = async (url, init = {}) => {
       const a = fakeTrip(LINE.slice(0, 11), 60), b = fakeTrip(LINE.slice(10), 60);
       return Response.json({ trip: { summary: { length: 2, time: 120 }, legs: [a.legs[0], b.legs[0]] } });
     }
+    if (signedTrip) return Response.json({ trip: signedTrip });
     return Response.json({ trip: fakeTrip(LINE, 120), alternates: [{ trip: fakeTrip(LINE.slice(0, 15), 90) }] });
   }
   if (u.includes('/trace_attributes')) {
-    return Response.json({ edges: [{ begin_shape_index: 0, speed_limit: 50 }, { begin_shape_index: 5, end_shape_index: 10, speed_limit: 50, end_node: { type: 'toll_booth' } }, { begin_shape_index: 10, speed_limit: 30 }, { begin_shape_index: 15 }] });
+    // A tunnel from shape index 12 to 15, in two edges (as Valhalla splits a long one).
+    return Response.json({ edges: [{ begin_shape_index: 0, speed_limit: 50 }, { begin_shape_index: 5, end_shape_index: 10, speed_limit: 50, end_node: { type: 'toll_booth' } }, { begin_shape_index: 10, end_shape_index: 12, speed_limit: 30 }, { begin_shape_index: 12, end_shape_index: 13, speed_limit: 30, tunnel: true }, { begin_shape_index: 13, end_shape_index: 15, speed_limit: 30, tunnel: true }, { begin_shape_index: 15 }] });
   }
   if (u.includes('openstreetmap.org/api/0.6/map')) {
     osmLookups++;
@@ -82,6 +86,10 @@ globalThis.fetch = async (url, init = {}) => {
     return new Response(`<osm><node id="1" lat="${(s + n) / 2 + 0.0001}" lon="${(w + e) / 2}"><tag k="barrier" v="toll_booth"/><tag k="name" v="Plaza Tol Ujian"/>`
       + '<tag k="charge" v="2.10 MYR/motorcar;1.10 MYR/taxi"/><tag k="payment:touchngo" v="yes"/><tag k="payment:touchngo_smarttag" v="yes"/><tag k="payment:touchngo_rfid" v="yes"/></node>'
       + `<node id="2" lat="${s}" lon="${w}"><tag k="barrier" v="toll_booth"/><tag k="name" v="Far booth"/></node></osm>`);
+  }
+  if (u.startsWith('https://overpass-api.de/')) {
+    overpassCalls++;
+    return Response.json({ elements: [{ type: 'node', id: 9, lat: 3.1579, lon: 101.7119, tags: { amenity: 'charging_station', name: 'Suria KLCC EV', 'socket:type2_combo': '2', 'socket:type2_combo:output': '60 kW' } }] });
   }
   if (u.includes('/reverse') && u.includes('osm_tag=amenity')) {
     return Response.json({ features: [
@@ -153,8 +161,8 @@ function client(device) {
 // open even when A2B is full). Everything else (accounts, places, reports, trips) doesn't.
 function needsSpot(method, path) {
   if (path === '/api/presence') return false;
-  if (method === 'GET' && (path.startsWith('/api/search') || path.startsWith('/api/reverse') || path.startsWith('/api/parking'))) return true;
-  return method === 'POST' && path === '/api/route';
+  if (method === 'GET' && (path.startsWith('/api/search') || path.startsWith('/api/reverse') || path.startsWith('/api/parking') || path.startsWith('/api/chargers'))) return true;
+  return method === 'POST' && (path === '/api/route' || path === '/api/transit');
 }
 
 let alice, bob;
@@ -189,6 +197,13 @@ test('route requests carry avoid options, heading and closures', () => {
   assert.equal(body.locations[0].heading, 92);
   assert.deepEqual(body.exclude_locations, [{ lat: 6, lon: 5 }]);
   assert.equal(body.units, 'miles');
+});
+
+test('walking routes ask Valhalla for a pedestrian route', () => {
+  const body = buildRouteRequest({ from: [1, 2], to: [3, 4], travel: 'walk', avoid: { tolls: true } });
+  assert.equal(body.costing, 'pedestrian');
+  assert.equal(body.costing_options.auto, undefined, 'no car options on foot');
+  assert.equal(buildRouteRequest({ from: [1, 2], to: [3, 4] }).costing, 'auto', 'driving stays the default');
 });
 
 test('turn lanes keep only junctions with a lane to follow', () => {
@@ -319,7 +334,22 @@ test('routes avoid reported closures and account for reported traffic', async ()
   assert.equal(r.body.routes[0].duration, 90, 'fastest first');
   assert.equal(full.steps[0].street, 'Test Street');
   assert.deepEqual(full.limits, [[0, 50], [10, 30], [15, null]]);
+  assert.deepEqual(full.tunnels, [[12, 15]], 'a tunnel in two edges is one stretch');
   assert.equal(full.shapes, undefined, 'encoded shapes stay on the server');
+});
+
+test('walking routes skip closures, reported traffic and the driving extras', async () => {
+  const r = await alice('POST', '/api/route', { from: [13.4, 52.5], to: [13.4, 52.509], travel: 'walk' });
+  assert.equal(r.status, 200);
+  assert.equal(lastRouteBody.costing, 'pedestrian');
+  assert.equal(lastRouteBody.exclude_locations.length, 0, 'road closures are for cars');
+  assert.equal(r.body.closures_avoided, 0);
+  for (const route of r.body.routes) {
+    assert.equal(route.travel, 'walk');
+    assert.equal(route.delay, 0, 'traffic reports add no time on foot');
+    assert.deepEqual([route.tolls, route.cameras, route.reports, route.limits], [[], [], [], null]);
+    assert.equal(route.shapes, undefined);
+  }
 });
 
 test('live traffic from TomTom times each route and marks its jams, and is skipped when TomTom fails', async () => {
@@ -404,6 +434,7 @@ test('a stop splits the drive into legs but stays one route', async () => {
   assert.deepEqual(route.steps.map((s) => s.begin), [0, 10, 10, 20]);
   // The fake service answers every leg the same way; the second leg's runs are shifted by its offset (10).
   assert.deepEqual(route.limits, [[0, 50], [10, 30], [15, null], [10, 50], [20, 30], [25, null]]);
+  assert.deepEqual(route.tunnels, [[12, 15], [22, 25]], 'each leg’s tunnel, at its offset');
 });
 
 test('polylines round-trip', () => {
@@ -557,7 +588,7 @@ test('testing tools are flagged only for accounts in TESTER_EMAILS', async () =>
   }
 });
 
-test('feedback: anyone can send it, only the owner can read it and mark it done', async () => {
+test('feedback: anyone can send it, only the owner can read it, close it and reopen it', async () => {
   const guest = client('feedback-guest-1');
   await guest('POST', '/api/presence');
   assert.equal((await guest('POST', '/api/feedback', { message: ' ' })).status, 400, 'empty feedback is refused');
@@ -579,9 +610,21 @@ test('feedback: anyone can send it, only the owner can read it and mark it done'
       ['Love the speed camera alerts!', 'Fran', 'fran@test.com', null],
       ['Route to KLCC took a closed road', null, null, 'abc123'],
     ]);
-    assert.equal((await fran('DELETE', `/api/feedback/${feedback[0].id}`)).status, 404, 'only the owner marks it done');
-    await owner('DELETE', `/api/feedback/${feedback[0].id}`);
-    assert.equal((await owner('GET', '/api/feedback')).body.feedback.length, 1);
+    assert.equal((await fran('PATCH', `/api/feedback/${feedback[0].id}`, { closed: true })).status, 404, 'only the owner closes it');
+    assert.equal((await fran('DELETE', `/api/feedback/${feedback[0].id}`)).status, 404);
+    await owner('PATCH', `/api/feedback/${feedback[0].id}`, { closed: true });
+    let list = (await owner('GET', '/api/feedback')).body.feedback;
+    assert.equal(list.length, 2, 'closing keeps it');
+    assert.deepEqual(list.map((f) => [f.message, Boolean(f.closed_at)]), [
+      ['Route to KLCC took a closed road', false],
+      ['Love the speed camera alerts!', true],
+    ], 'open first, closed after');
+    await owner('PATCH', `/api/feedback/${feedback[0].id}`, { closed: false });
+    assert.equal((await owner('GET', '/api/feedback')).body.feedback.find((f) => f.id === feedback[0].id).closed_at, null, 'reopened');
+    await owner('DELETE', `/api/feedback/${feedback[1].id}`);
+    list = (await owner('GET', '/api/feedback')).body.feedback;
+    assert.equal(list.length, 2, "an old app's Done closes it rather than deleting it");
+    assert.ok(list.find((f) => f.id === feedback[1].id).closed_at);
   } finally {
     delete env.TESTER_EMAILS;
   }
@@ -905,5 +948,61 @@ test('presence check-ins admit new devices without a per-network throttle', asyn
     for (let i = 0; i < 5; i++) assert.equal((await check(`fresh-device-${i}`)).status, 200);
   } finally {
     await env.DB.prepare('DELETE FROM presence').run();
+  }
+});
+
+test('an exit’s sign comes with its step, and the cues name it', async () => {
+  const coords = [[13.4, 52.5], [13.4, 52.505], [13.401, 52.51]];
+  const trip = fakeTrip(coords, 120);
+  trip.legs[0].maneuvers.splice(1, 0, {
+    type: 21, instruction: 'Take exit 218 on the left.', verbal_transition_alert_instruction: 'Take exit 218.', verbal_pre_transition_instruction: 'Take exit 218 onto 241.',
+    street_names: ['241'], begin_shape_index: 1, end_shape_index: 2, length: 0.5, time: 30,
+    sign: { exit_number_elements: [{ text: '218' }], exit_branch_elements: [{ text: '241' }], exit_toward_elements: [{ text: 'Seremban' }, { text: 'Labu' }] },
+  });
+  trip.legs[0].maneuvers[0].end_shape_index = 1;
+  signedTrip = trip;
+  try {
+    const r = await client()('POST', '/api/route', { from: [13.4, 52.5], to: [13.401, 52.51] });
+    assert.equal(r.status, 200);
+    const exit = r.body.routes[0].steps.find((st) => st.sign);
+    assert.deepEqual(exit.sign, { exit: '218', roads: ['241'], toward: ['Seremban', 'Labu'] });
+    assert.equal(exit.alert, 'Take exit 218 towards Seremban and Labu.');
+    assert.equal(exit.pre, 'Take exit 218 onto 241 towards Seremban and Labu.');
+    assert.ok(r.body.routes[0].steps.filter((st) => st !== exit).every((st) => !('sign' in st)), 'only exits carry one');
+  } finally {
+    signedTrip = null;
+  }
+});
+
+test('EV chargers: the whole list, fetched from OpenStreetMap by the nightly job and kept in the database', async () => {
+  const alice = client();
+  await env.DB.prepare('DELETE FROM chargers').run();
+  const calls = overpassCalls;
+  const empty = await alice('GET', '/api/chargers');
+  assert.equal(empty.status, 200);
+  assert.deepEqual(empty.body.chargers, []);
+  assert.equal(overpassCalls, calls, 'a request never downloads them');
+  await worker.scheduled({}, env);
+  assert.equal(overpassCalls, calls + 1, 'the nightly job does');
+  const r = await alice('GET', '/api/chargers');
+  assert.deepEqual(r.body.chargers, [['Suria KLCC EV', 101.7119, 3.1579, 'CCS2 · up to 60 kW', 'ev_charging_station']]);
+  await worker.scheduled({}, env);
+  assert.equal(overpassCalls, calls + 1, 'not again within the week');
+});
+
+test('trips by train need a spot, a start and a destination', async () => {
+  assert.equal((await client('transit-no-spot')('POST', '/api/transit', { from: [101.6865, 3.134], to: [101.7116, 3.1579] })).status, 503);
+  const c = client();
+  assert.equal((await c('POST', '/api/transit', { from: [101.6865, 3.134] })).status, 400);
+  const res = await c('POST', '/api/transit', { from: [101.6865, 3.134], to: [101.7116, 3.1579] });
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(res.body.trips));
+  assert.equal(typeof res.body.walk, 'number');
+  for (const trip of res.body.trips) assert.ok(trip.legs.some((l) => l.mode === 'train') && trip.arrive > trip.depart);
+  // Each ride carries its stations in order with the seconds after boarding, for following the trip on the phone.
+  for (const l of res.body.trips.flatMap((t) => t.legs).filter((x) => x.mode === 'train')) {
+    assert.equal(l.stations.length, l.stops + 1);
+    assert.deepEqual([l.stations[0][0], l.stations.at(-1)[0]], [l.from.name, l.to.name]);
+    assert.ok(l.stations.every(([name, lat, lng, t], i) => typeof name === 'string' && Math.abs(lat) < 90 && Math.abs(lng) < 180 && (!i || t > l.stations[i - 1][3])));
   }
 });

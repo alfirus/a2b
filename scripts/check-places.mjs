@@ -10,8 +10,17 @@ if (!existsSync(index)) {
   console.warn('\n⚠  No place data in public/places/. Search will only use OpenStreetMap.');
   console.warn('   Build it first: pip install duckdb && npm run places\n');
 } else {
-  const { release, count, built } = JSON.parse(readFileSync(index, 'utf8'));
+  const { release, count, built, areas = [] } = JSON.parse(readFileSync(index, 'utf8'));
   console.log(`Place data: Overture ${release}, ${count.toLocaleString()} places, built ${built}.`);
+  // Searches like "petrol" or "klinik" and the map's petrol stations, hospitals and clinics need the per-kind files.
+  const typed = areas.some((a) => {
+    const files = new URL(`../public/places/${a}/files.json`, import.meta.url);
+    return existsSync(files) && '@fuel' in JSON.parse(readFileSync(files, 'utf8'));
+  });
+  if (!typed) {
+    console.warn('\n⚠  The place data has no files by kind of place, so "petrol", "hospital" or "klinik" only match names');
+    console.warn('   and the map shows no petrol stations, hospitals or clinics. Rebuild it: npm run places\n');
+  }
 }
 
 const roads = new URL('../public/construction/index.json', import.meta.url);

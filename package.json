@@ -19,7 +19,8 @@
     "places": "python3 scripts/build-places.py",
     "predeploy": "node scripts/check-places.mjs && node scripts/app-version.mjs",
     "construction": "python3 scripts/build-construction.py",
-    "cameras": "node scripts/build-cameras.mjs"
+    "cameras": "node scripts/build-cameras.mjs",
+    "transit": "python3 scripts/build-transit.py"
   },
   "devDependencies": {
     "wrangler": "4.151.3"
